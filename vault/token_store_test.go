@@ -3,14 +3,17 @@ package vault
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/vault/helper/locksutil"
 	"github.com/hashicorp/vault/logical"
 )
 
@@ -220,8 +223,11 @@ func testCoreMakeToken(t *testing.T, c *Core, root, client, ttl string, policy [
 	if err != nil {
 		t.Fatalf("err: %v %v", err, resp)
 	}
+	if resp.IsError() {
+		t.Fatalf("err: %v %v", err, *resp)
+	}
 	if resp.Auth.ClientToken != client {
-		t.Fatalf("bad: %#v", resp)
+		t.Fatalf("bad: %#v", *resp)
 	}
 }
 
@@ -448,6 +454,8 @@ func TestTokenStore_CreateLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	ts2.SetExpirationManager(c.expiration)
+
 	if err := ts2.Initialize(); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -493,6 +501,8 @@ func TestTokenStore_CreateLookup_ProvidedID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	ts2.SetExpirationManager(c.expiration)
+
 	if err := ts2.Initialize(); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -504,6 +514,72 @@ func TestTokenStore_CreateLookup_ProvidedID(t *testing.T) {
 	}
 	if !reflect.DeepEqual(out, ent) {
 		t.Fatalf("bad: expected:%#v\nactual:%#v", ent, out)
+	}
+}
+
+func TestTokenStore_CreateLookup_ExpirationInRestoreMode(t *testing.T) {
+	_, ts, _, _ := TestCoreWithTokenStore(t)
+
+	ent := &TokenEntry{Path: "test", Policies: []string{"dev", "ops"}}
+	if err := ts.create(ent); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if ent.ID == "" {
+		t.Fatalf("missing ID")
+	}
+
+	// Replace the lease with a lease with an expire time in the past
+	saltedID, err := ts.SaltID(ent.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create a lease entry
+	leaseID := path.Join(ent.Path, saltedID)
+	le := &leaseEntry{
+		LeaseID:     leaseID,
+		ClientToken: ent.ID,
+		Path:        ent.Path,
+		IssueTime:   time.Now(),
+		ExpireTime:  time.Now().Add(1 * time.Hour),
+	}
+	if err := ts.expiration.persistEntry(le); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	out, err := ts.Lookup(ent.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !reflect.DeepEqual(out, ent) {
+		t.Fatalf("bad: expected:%#v\nactual:%#v", ent, out)
+	}
+
+	// Set to expired lease time
+	le.ExpireTime = time.Now().Add(-1 * time.Hour)
+	if err := ts.expiration.persistEntry(le); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	err = ts.expiration.Stop()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reset expiration manager to restore mode
+	ts.expiration.restoreModeLock.Lock()
+	atomic.StoreInt32(&ts.expiration.restoreMode, 1)
+	ts.expiration.restoreLocks = locksutil.CreateLocks()
+	ts.expiration.restoreModeLock.Unlock()
+
+	// Test that the token lookup does not return the token entry due to the
+	// expired lease
+	out, err = ts.Lookup(ent.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if out != nil {
+		t.Fatalf("lease expired, no token expected: %#v", out)
 	}
 }
 
@@ -1037,7 +1113,7 @@ func TestTokenStore_HandleRequest_CreateToken_NonRoot_RootChild(t *testing.T) {
 	core, ts, _, root := TestCoreWithTokenStore(t)
 	ps := core.policyStore
 
-	policy, _ := Parse(tokenCreationPolicy)
+	policy, _ := ParseACLPolicy(tokenCreationPolicy)
 	policy.Name = "test1"
 	if err := ps.SetPolicy(policy); err != nil {
 		t.Fatal(err)
@@ -1376,6 +1452,7 @@ func TestTokenStore_HandleRequest_Lookup(t *testing.T) {
 		"ttl":              int64(0),
 		"explicit_max_ttl": int64(0),
 		"expire_time":      nil,
+		"entity_id":        "",
 	}
 
 	if resp.Data["creation_time"].(int64) == 0 {
@@ -1415,6 +1492,7 @@ func TestTokenStore_HandleRequest_Lookup(t *testing.T) {
 		"ttl":              int64(3600),
 		"explicit_max_ttl": int64(0),
 		"renewable":        true,
+		"entity_id":        "",
 	}
 
 	if resp.Data["creation_time"].(int64) == 0 {
@@ -1465,6 +1543,7 @@ func TestTokenStore_HandleRequest_Lookup(t *testing.T) {
 		"ttl":              int64(3600),
 		"explicit_max_ttl": int64(0),
 		"renewable":        true,
+		"entity_id":        "",
 	}
 
 	if resp.Data["creation_time"].(int64) == 0 {
@@ -1546,6 +1625,7 @@ func TestTokenStore_HandleRequest_LookupSelf(t *testing.T) {
 		"creation_ttl":     int64(3600),
 		"ttl":              int64(3600),
 		"explicit_max_ttl": int64(0),
+		"entity_id":        "",
 	}
 
 	if resp.Data["creation_time"].(int64) == 0 {
@@ -1889,19 +1969,19 @@ func TestTokenStore_RoleDisallowedPolicies(t *testing.T) {
 	ps := core.policyStore
 
 	// Create 3 different policies
-	policy, _ := Parse(tokenCreationPolicy)
+	policy, _ := ParseACLPolicy(tokenCreationPolicy)
 	policy.Name = "test1"
 	if err := ps.SetPolicy(policy); err != nil {
 		t.Fatal(err)
 	}
 
-	policy, _ = Parse(tokenCreationPolicy)
+	policy, _ = ParseACLPolicy(tokenCreationPolicy)
 	policy.Name = "test2"
 	if err := ps.SetPolicy(policy); err != nil {
 		t.Fatal(err)
 	}
 
-	policy, _ = Parse(tokenCreationPolicy)
+	policy, _ = ParseACLPolicy(tokenCreationPolicy)
 	policy.Name = "test3"
 	if err := ps.SetPolicy(policy); err != nil {
 		t.Fatal(err)
@@ -2530,9 +2610,14 @@ func TestTokenStore_RoleExplicitMaxTTL(t *testing.T) {
 			t.Fatalf("expected error")
 		}
 
+		time.Sleep(2 * time.Second)
+
 		req.Operation = logical.ReadOperation
 		req.Path = "auth/token/lookup-self"
 		resp, err = core.HandleRequest(req)
+		if resp != nil && err == nil {
+			t.Fatalf("expected error, response is %#v", *resp)
+		}
 		if err == nil {
 			t.Fatalf("expected error")
 		}
@@ -2813,7 +2898,7 @@ func TestTokenStore_NoDefaultPolicy(t *testing.T) {
 
 	core, ts, _, root := TestCoreWithTokenStore(t)
 	ps := core.policyStore
-	policy, _ := Parse(tokenCreationPolicy)
+	policy, _ := ParseACLPolicy(tokenCreationPolicy)
 	policy.Name = "policy1"
 	if err := ps.SetPolicy(policy); err != nil {
 		t.Fatal(err)

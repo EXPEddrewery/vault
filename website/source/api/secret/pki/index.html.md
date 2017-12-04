@@ -41,6 +41,7 @@ update your API calls accordingly.
 * [Generate Root](#generate-root)
 * [Delete Root](#delete-root)
 * [Sign Intermediate](#sign-intermediate)
+* [Sign Self-Issued](#sign-self-issued)
 * [Sign Certificate](#sign-certificate)
 * [Sign Verbatim](#sign-verbatim)
 * [Tidy](#tidy)
@@ -140,6 +141,7 @@ This endpoint returns a list of the current certificates by serial number only.
 | Method   | Path                         | Produces               |
 | :------- | :--------------------------- | :--------------------- |
 | `LIST`   | `/pki/certs`                 | `200 application/json` |
+| `GET`    | `/pki/certs?list=true`       | `200 application/json` |
 
 
 ### Sample Request
@@ -294,7 +296,7 @@ $ curl \
   "data": {
     "issuing_certificates": ["<url1>", "<url2>"],
     "crl_distribution_points": ["<url1>", "<url2>"],
-    "ocsp_servers": ["<url1>", "<url2>"],
+    "ocsp_servers": ["<url1>", "<url2>"]
   },
   "auth": null
 }
@@ -315,13 +317,15 @@ parameter.
 ### Parameters
 
 - `issuing_certificates` `(array<string>: nil)` – Specifies the URL values for
-  the Issuing Certificate field.
+  the Issuing Certificate field. This can be an array or a comma-separated
+  string list.
 
 - `crl_distribution_points` `(array<string>: nil)` – Specifies the URL values
-  for the CRL Distribution Points field.
+  for the CRL Distribution Points field. This can be an array or a
+  comma-separated string list.
 
 - `ocsp_servers` `(array<string>: nil)` – Specifies the URL values for the OCSP
-  Servers field.
+  Servers field. This can be an array or a comma-separated string list.
 
 ### Sample Payload
 
@@ -370,9 +374,9 @@ $ curl \
 
 ## Rotate CRLs
 
-This endpoint this endpoint forces a rotation of the CRL. This can be used by
-administrators to cut the size of the CRL if it contains a number of
-certificates that have now expired, but has not been rotated due to no further
+This endpoint forces a rotation of the CRL. This can be used by administrators
+to cut the size of the CRL if it contains a number of certificates
+that have now expired, but has not been rotated due to no further
 certificates being revoked.
 
 | Method   | Path                         | Produces               |
@@ -432,6 +436,11 @@ can be set in a CSR are supported.
   `pem`, `der`, or `pem_bundle`; defaults to `pem`. If `der`, the output is
   base64 encoded. If `pem_bundle`, the `csr` field will contain the private key
   (if exported) and CSR, concatenated.
+
+- `private_key_format` `(string: "")` – Specifies the format for marshaling the
+  private key. Defaults to `der` which will return either base64-encoded DER or
+  PEM-encoded DER, depending on the value of `format`. The other option is
+  `pkcs8` which will return the key marshalled as PEM-encoded PKCS8.
 
 - `key_type` `(string: "rsa")` – Specifies the desired key type; must be `rsa`
   or `ec`.
@@ -551,6 +560,11 @@ need to request a new certificate.**
   base64 encoded. If `pem_bundle`, the `certificate` field will contain the
   private key and certificate, concatenated; if the issuing CA is not a
   Vault-derived self-signed root, this will be included as well.
+
+- `private_key_format` `(string: "")` – Specifies the format for marshaling the
+  private key. Defaults to `der` which will return either base64-encoded DER or
+  PEM-encoded DER, depending on the value of `format`. The other option is
+  `pkcs8` which will return the key marshalled as PEM-encoded PKCS8.
 
 - `exclude_cn_from_sans` `(bool: false)` – If true, the given `common_name` will
   not be included in DNS or Email Subject Alternate Names (as appropriate).
@@ -833,6 +847,7 @@ returned, not any values.
 | Method   | Path                         | Produces               |
 | :------- | :--------------------------- | :--------------------- |
 | `LIST`   | `/pki/roles`                 | `200 application/json` |
+| `GET`    | `/pki/roles?list=true`       | `200 application/json` |
 
 ### Sample Request
 
@@ -926,6 +941,11 @@ Vault would overwrite the existing cert/key with new values.
   `pem_bundle`, the `certificate` field will contain the private key (if
   exported) and certificate, concatenated; if the issuing CA is not a
   Vault-derived self-signed root, this will be included as well.
+
+- `private_key_format` `(string: "")` – Specifies the format for marshaling the
+  private key. Defaults to `der` which will return either base64-encoded DER or
+  PEM-encoded DER, depending on the value of `format`. The other option is
+  `pkcs8` which will return the key marshalled as PEM-encoded PKCS8.
 
 - `key_type` `(string: "rsa")` – Specifies the desired key type; must be `rsa`
   or `ec`.
@@ -1032,7 +1052,8 @@ verbatim.
 
 - `ttl` `(string: "")` – Specifies the requested Time To Live (after which the
   certificate will be expired). This cannot be larger than the mount max (or, if
-  not set, the system max).
+  not set, the system max). However, this can be after the expiration of the
+  signing CA.
 
 - `format` `(string: "pem")` – Specifies the format for returned data. Can be
   `pem`, `der`, or `pem_bundle`. If `der`, the output is base64 encoded. If
@@ -1071,7 +1092,6 @@ verbatim.
 {
   "csr": "...",
   "common_name": "example.com"
-
 }
 ```
 
@@ -1101,6 +1121,65 @@ $ curl \
   "auth": null
 }
 ```
+## Sign Self-Issued
+
+This endpoint uses the configured CA certificate to sign a self-issued
+certificate (which will usually be a self-signed certificate as well).
+
+**_This is an extremely privileged endpoint_**. The given certificate will be
+signed as-is with only minimal validation performed (is it a CA cert, and is it
+actually self-issued). The only values that will be changed will be the
+authority key ID, the issuer DN, and, if set, any distribution points.
+
+This is generally only needed for root certificate rolling in cases where you
+don't want/can't get access to a CSR (such as if it's a root stored in Vault
+where the key is not exposed). If you don't know whether you need this
+endpoint, you most likely should be using a different endpoint (such as
+`sign-intermediate`).
+
+This endpoint requires `sudo` capability.
+
+| Method   | Path                         | Produces               |
+| :------- | :--------------------------- | :--------------------- |
+| `POST`   | `/pki/root/sign-self-issued` | `200 application/json` |
+
+### Parameters
+
+- `certificate` `(string: <required>)` – Specifies the PEM-encoded self-issued certificate.
+
+### Sample Payload
+
+```json
+{
+  "certificate": "..."
+}
+```
+
+### Sample Request
+
+```
+$ curl \
+    --header "X-Vault-Token: ..." \
+    --request POST \
+    --data @payload.json \
+    https://vault.rocks/v1/pki/root/sign-self-issued
+```
+
+### Sample Response
+
+```json
+{
+  "lease_id": "",
+  "renewable": false,
+  "lease_duration": 0,
+  "data": {
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIDzDCCAragAwIBAgIUOd0ukLcjH43TfTHFG9qE0FtlMVgwCwYJKoZIhvcNAQEL\n...\numkqeYeO30g1uYvDuWLXVA==\n-----END CERTIFICATE-----\n",
+    "issuing_ca": "-----BEGIN CERTIFICATE-----\nMIIDUTCCAjmgAwIBAgIJAKM+z4MSfw2mMA0GCSqGSIb3DQEBCwUAMBsxGTAXBgNV\n...\nG/7g4koczXLoUM3OQXd5Aq2cs4SS1vODrYmgbioFsQ3eDHd1fg==\n-----END CERTIFICATE-----\n",
+  },
+  "auth": null
+}
+```
+
 
 ## Sign Certificate
 
