@@ -26,21 +26,23 @@ func handleSysGenerateRootAttempt(core *vault.Core, generateStrategy vault.Gener
 }
 
 func handleSysGenerateRootAttemptGet(core *vault.Core, w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := core.GetContext()
+	defer cancel()
+
 	// Get the current seal configuration
-	barrierConfig, err := core.SealAccess().BarrierConfig()
+	barrierConfig, err := core.SealAccess().BarrierConfig(ctx)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if barrierConfig == nil {
-		respondError(w, http.StatusBadRequest, fmt.Errorf(
-			"server is not yet initialized"))
+		respondError(w, http.StatusBadRequest, fmt.Errorf("server is not yet initialized"))
 		return
 	}
 
 	sealConfig := barrierConfig
 	if core.SealAccess().RecoveryKeySupported() {
-		sealConfig, err = core.SealAccess().RecoveryConfig()
+		sealConfig, err = core.SealAccess().RecoveryConfig(ctx)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
 			return
@@ -140,8 +142,11 @@ func handleSysGenerateRootUpdate(core *vault.Core, generateStrategy vault.Genera
 			}
 		}
 
+		ctx, cancel := core.GetContext()
+		defer cancel()
+
 		// Use the key to make progress on root generation
-		result, err := core.GenerateRootUpdate(key, req.Nonce, generateStrategy)
+		result, err := core.GenerateRootUpdate(ctx, key, req.Nonce, generateStrategy)
 		if err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return

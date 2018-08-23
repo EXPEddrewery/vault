@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -22,7 +23,7 @@ func TestHandler_cors(t *testing.T) {
 
 	// Enable CORS and allow from any origin for testing.
 	corsConfig := core.CORSConfig()
-	err := corsConfig.Enable([]string{addr}, nil)
+	err := corsConfig.Enable(context.Background(), []string{addr}, nil)
 	if err != nil {
 		t.Fatalf("Error enabling CORS: %s", err)
 	}
@@ -129,6 +130,26 @@ func TestHandler_CacheControlNoStore(t *testing.T) {
 	}
 }
 
+func TestHandler_Accepted(t *testing.T) {
+	core, _, token := vault.TestCoreUnsealed(t)
+	ln, addr := TestServer(t, core)
+	defer ln.Close()
+
+	req, err := http.NewRequest("POST", addr+"/v1/auth/token/tidy", nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	req.Header.Set(AuthHeaderName, token)
+
+	client := cleanhttp.DefaultClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	testResponseStatus(t, resp, 202)
+}
+
 // We use this test to verify header auth
 func TestSysMounts_headerAuth(t *testing.T) {
 	core, _, token := vault.TestCoreUnsealed(t)
@@ -167,6 +188,7 @@ func TestSysMounts_headerAuth(t *testing.T) {
 				},
 				"local":     false,
 				"seal_wrap": false,
+				"options":   map[string]interface{}{"version": "1"},
 			},
 			"sys/": map[string]interface{}{
 				"description": "system endpoints used for control, policy and debugging",
@@ -179,6 +201,7 @@ func TestSysMounts_headerAuth(t *testing.T) {
 				},
 				"local":     false,
 				"seal_wrap": false,
+				"options":   interface{}(nil),
 			},
 			"cubbyhole/": map[string]interface{}{
 				"description": "per-token private secret storage",
@@ -191,6 +214,7 @@ func TestSysMounts_headerAuth(t *testing.T) {
 				},
 				"local":     true,
 				"seal_wrap": false,
+				"options":   interface{}(nil),
 			},
 			"identity/": map[string]interface{}{
 				"description": "identity store",
@@ -203,55 +227,8 @@ func TestSysMounts_headerAuth(t *testing.T) {
 				},
 				"local":     false,
 				"seal_wrap": false,
+				"options":   interface{}(nil),
 			},
-		},
-		"secret/": map[string]interface{}{
-			"description": "key/value secret storage",
-			"type":        "kv",
-			"config": map[string]interface{}{
-				"default_lease_ttl": json.Number("0"),
-				"max_lease_ttl":     json.Number("0"),
-				"force_no_cache":    false,
-				"plugin_name":       "",
-			},
-			"local":     false,
-			"seal_wrap": false,
-		},
-		"sys/": map[string]interface{}{
-			"description": "system endpoints used for control, policy and debugging",
-			"type":        "system",
-			"config": map[string]interface{}{
-				"default_lease_ttl": json.Number("0"),
-				"max_lease_ttl":     json.Number("0"),
-				"force_no_cache":    false,
-				"plugin_name":       "",
-			},
-			"local":     false,
-			"seal_wrap": false,
-		},
-		"cubbyhole/": map[string]interface{}{
-			"description": "per-token private secret storage",
-			"type":        "cubbyhole",
-			"config": map[string]interface{}{
-				"default_lease_ttl": json.Number("0"),
-				"max_lease_ttl":     json.Number("0"),
-				"force_no_cache":    false,
-				"plugin_name":       "",
-			},
-			"local":     true,
-			"seal_wrap": false,
-		},
-		"identity/": map[string]interface{}{
-			"description": "identity store",
-			"type":        "identity",
-			"config": map[string]interface{}{
-				"default_lease_ttl": json.Number("0"),
-				"max_lease_ttl":     json.Number("0"),
-				"force_no_cache":    false,
-				"plugin_name":       "",
-			},
-			"local":     false,
-			"seal_wrap": false,
 		},
 	}
 	testResponseStatus(t, resp, 200)
@@ -262,7 +239,6 @@ func TestSysMounts_headerAuth(t *testing.T) {
 		if v.(map[string]interface{})["accessor"] == "" {
 			t.Fatalf("no accessor from %s", k)
 		}
-		expected[k].(map[string]interface{})["accessor"] = v.(map[string]interface{})["accessor"]
 		expected["data"].(map[string]interface{})[k].(map[string]interface{})["accessor"] = v.(map[string]interface{})["accessor"]
 	}
 
@@ -353,7 +329,7 @@ func TestHandler_sealed(t *testing.T) {
 func TestHandler_error(t *testing.T) {
 	w := httptest.NewRecorder()
 
-	respondError(w, 500, errors.New("Test Error"))
+	respondError(w, 500, errors.New("test Error"))
 
 	if w.Code != 500 {
 		t.Fatalf("expected 500, got %d", w.Code)
@@ -378,5 +354,39 @@ func TestHandler_error(t *testing.T) {
 	if w3.Code != 503 {
 		t.Fatalf("expected 503, got %d", w3.Code)
 	}
+}
 
+func TestHandler_nonPrintableChars(t *testing.T) {
+	testNonPrintable(t, false)
+	testNonPrintable(t, true)
+}
+
+func testNonPrintable(t *testing.T, disable bool) {
+	core, _, token := vault.TestCoreUnsealed(t)
+	ln, addr := TestListener(t)
+	props := &vault.HandlerProperties{
+		Core:                  core,
+		MaxRequestSize:        DefaultMaxRequestSize,
+		DisablePrintableCheck: disable,
+	}
+	TestServerWithListenerAndProperties(t, ln, addr, core, props)
+	defer ln.Close()
+
+	req, err := http.NewRequest("PUT", addr+"/v1/cubbyhole/foo\u2028bar", strings.NewReader(`{"zip": "zap"}`))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	req.Header.Set(AuthHeaderName, token)
+
+	client := cleanhttp.DefaultClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if disable {
+		testResponseStatus(t, resp, 204)
+	} else {
+		testResponseStatus(t, resp, 400)
+	}
 }

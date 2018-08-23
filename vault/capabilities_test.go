@@ -1,9 +1,11 @@
 package vault
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/vault/logical"
 )
@@ -35,19 +37,19 @@ path "secret/sample" {
 `
 	// Create the above policies
 	policy, _ := ParseACLPolicy(policy1)
-	err = c.policyStore.SetPolicy(policy)
+	err = c.policyStore.SetPolicy(context.Background(), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	policy, _ = ParseACLPolicy(policy2)
-	err = c.policyStore.SetPolicy(policy)
+	err = c.policyStore.SetPolicy(context.Background(), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	policy, _ = ParseACLPolicy(policy3)
-	err = c.policyStore.SetPolicy(policy)
+	err = c.policyStore.SetPolicy(context.Background(), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -60,24 +62,23 @@ path "secret/sample" {
 			"policies": "policy1",
 		},
 	}
-	resp, err = i.HandleRequest(entityReq)
+	resp, err = i.HandleRequest(context.Background(), entityReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v\nerr: %#v\n", resp, err)
 	}
 	entityID := resp.Data["id"].(string)
 
 	// Create a token for the entity and assign policy2 on the token
-	ent := &TokenEntry{
+	ent := &logical.TokenEntry{
 		ID:       "capabilitiestoken",
 		Path:     "secret/sample",
 		Policies: []string{"policy2"},
 		EntityID: entityID,
+		TTL:      time.Hour,
 	}
-	if err := c.tokenStore.create(ent); err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	testMakeTokenDirectly(t, c.tokenStore, ent)
 
-	actual, err := c.Capabilities("capabilitiestoken", "secret/sample")
+	actual, err := c.Capabilities(context.Background(), "capabilitiestoken", "secret/sample")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -97,12 +98,12 @@ path "secret/sample" {
 			"policies":          "policy3",
 		},
 	}
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v\nerr: %#v\n", resp, err)
 	}
 
-	actual, err = c.Capabilities("capabilitiestoken", "secret/sample")
+	actual, err = c.Capabilities(context.Background(), "capabilitiestoken", "secret/sample")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -117,7 +118,7 @@ path "secret/sample" {
 func TestCapabilities(t *testing.T) {
 	c, _, token := TestCoreUnsealed(t)
 
-	actual, err := c.Capabilities(token, "path")
+	actual, err := c.Capabilities(context.Background(), token, "path")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -128,22 +129,21 @@ func TestCapabilities(t *testing.T) {
 
 	// Create a policy
 	policy, _ := ParseACLPolicy(aclPolicy)
-	err = c.policyStore.SetPolicy(policy)
+	err = c.policyStore.SetPolicy(context.Background(), policy)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	// Create a token for the policy
-	ent := &TokenEntry{
+	ent := &logical.TokenEntry{
 		ID:       "capabilitiestoken",
 		Path:     "testpath",
 		Policies: []string{"dev"},
+		TTL:      time.Hour,
 	}
-	if err := c.tokenStore.create(ent); err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	testMakeTokenDirectly(t, c.tokenStore, ent)
 
-	actual, err = c.Capabilities("capabilitiestoken", "foo/bar")
+	actual, err = c.Capabilities(context.Background(), "capabilitiestoken", "foo/bar")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}

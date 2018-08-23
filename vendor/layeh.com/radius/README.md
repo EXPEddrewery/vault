@@ -1,3 +1,5 @@
+<img src="internal/radius.svg" width="250" align="right">
+
 # radius [![GoDoc](https://godoc.org/layeh.com/radius?status.svg)](https://godoc.org/layeh.com/radius)
 
 a Go (golang) [RADIUS](https://tools.ietf.org/html/rfc2865) client and server implementation
@@ -28,11 +30,7 @@ func main() {
 		panic(err)
 	}
 
-	if response.Code == radius.CodeAccessAccept {
-		fmt.Println("Accepted")
-	} else {
-		fmt.Println("Denied")
-	}
+	fmt.Println("Code:", response.Code)
 }
 ```
 
@@ -42,10 +40,14 @@ Included in this package is the command line program `radius-dict-gen`. It can b
 
     go get -u layeh.com/radius/cmd/radius-dict-gen
 
-This program will generate helper functions and types for reading and manipulating RADIUS attributes in a packet. It is recommended that generated code be used for any RADIUS dictionary you would like to consume.
+Given a FreeRADIUS dictionary, the program will generate helper functions and types for reading and manipulating RADIUS attributes in a packet. It is recommended that generated code be used for any RADIUS dictionary you would like to consume.
 
 Included in this repository are sub-packages of generated helpers for commonly used RADIUS attributes, including [`rfc2865`](https://godoc.org/layeh.com/radius/rfc2865) and [`rfc2866`](https://godoc.org/layeh.com/radius/rfc2866).
 
 ## License
 
 MPL 2.0
+
+## Author
+
+Tim Cooper (<tim.cooper@layeh.com>)

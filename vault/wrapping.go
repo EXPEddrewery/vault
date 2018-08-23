@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -23,8 +24,8 @@ const (
 	coreWrappingJWTKeyPath = "core/wrapping/jwtkey"
 )
 
-func (c *Core) ensureWrappingKey() error {
-	entry, err := c.barrier.Get(coreWrappingJWTKeyPath)
+func (c *Core) ensureWrappingKey(ctx context.Context) error {
+	entry, err := c.barrier.Get(ctx, coreWrappingJWTKeyPath)
 	if err != nil {
 		return err
 	}
@@ -48,7 +49,7 @@ func (c *Core) ensureWrappingKey() error {
 			Key:   coreWrappingJWTKeyPath,
 			Value: val,
 		}
-		if err = c.barrier.Put(entry); err != nil {
+		if err = c.barrier.Put(ctx, entry); err != nil {
 			return errwrap.Wrapf("failed to store wrapping key: {{err}}", err)
 		}
 	}
@@ -67,22 +68,29 @@ func (c *Core) ensureWrappingKey() error {
 		D: keyParams.D,
 	}
 
-	c.logger.Info("core: loaded wrapping token key")
+	c.logger.Info("loaded wrapping token key")
 
 	return nil
 }
 
-func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, auth *logical.Auth) (*logical.Response, error) {
+func (c *Core) wrapInCubbyhole(ctx context.Context, req *logical.Request, resp *logical.Response, auth *logical.Auth) (*logical.Response, error) {
 	// Before wrapping, obey special rules for listing: if no entries are
 	// found, 404. This prevents unwrapping only to find empty data.
 	if req.Operation == logical.ListOperation {
-		if resp == nil || len(resp.Data) == 0 {
+		if resp == nil || (len(resp.Data) == 0 && len(resp.Warnings) == 0) {
 			return nil, logical.ErrUnsupportedPath
 		}
+
 		keysRaw, ok := resp.Data["keys"]
 		if !ok || keysRaw == nil {
+			if len(resp.Data) > 0 || len(resp.Warnings) > 0 {
+				// We could be returning extra metadata on a list, or returning
+				// warnings with no data, so handle these cases
+				goto DONELISTHANDLING
+			}
 			return nil, logical.ErrUnsupportedPath
 		}
+
 		keys, ok := keysRaw.([]string)
 		if !ok {
 			return nil, logical.ErrUnsupportedPath
@@ -92,6 +100,7 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 		}
 	}
 
+DONELISTHANDLING:
 	var err error
 	sealWrap := resp.WrapInfo.SealWrap
 
@@ -100,7 +109,7 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 	// wrapping token ID in the audit logs, so that it can be determined from
 	// the audit logs whether the token was ever actually used.
 	creationTime := time.Now()
-	te := TokenEntry{
+	te := logical.TokenEntry{
 		Path:           req.Path,
 		Policies:       []string{"response-wrapping"},
 		CreationTime:   creationTime.Unix(),
@@ -109,8 +118,8 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 		ExplicitMaxTTL: resp.WrapInfo.TTL,
 	}
 
-	if err := c.tokenStore.create(&te); err != nil {
-		c.logger.Error("core: failed to create wrapping token", "error", err)
+	if err := c.tokenStore.create(ctx, &te); err != nil {
+		c.logger.Error("failed to create wrapping token", "error", err)
 		return nil, ErrInternalError
 	}
 
@@ -150,7 +159,8 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 		jwt := jws.NewJWT(claims, crypto.SigningMethodES512)
 		serWebToken, err := jwt.Serialize(c.wrappingJWTKey)
 		if err != nil {
-			c.logger.Error("core: failed to serialize JWT", "error", err)
+			c.tokenStore.revokeOrphan(ctx, te.ID)
+			c.logger.Error("failed to serialize JWT", "error", err)
 			return nil, ErrInternalError
 		}
 		resp.WrapInfo.Token = string(serWebToken)
@@ -190,7 +200,8 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 
 		marshaledResponse, err := json.Marshal(httpResponse)
 		if err != nil {
-			c.logger.Error("core: failed to marshal wrapped response", "error", err)
+			c.tokenStore.revokeOrphan(ctx, te.ID)
+			c.logger.Error("failed to marshal wrapped response", "error", err)
 			return nil, ErrInternalError
 		}
 
@@ -199,16 +210,16 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 		}
 	}
 
-	cubbyResp, err := c.router.Route(cubbyReq)
+	cubbyResp, err := c.router.Route(ctx, cubbyReq)
 	if err != nil {
 		// Revoke since it's not yet being tracked for expiration
-		c.tokenStore.Revoke(te.ID)
-		c.logger.Error("core: failed to store wrapped response information", "error", err)
+		c.tokenStore.revokeOrphan(ctx, te.ID)
+		c.logger.Error("failed to store wrapped response information", "error", err)
 		return nil, ErrInternalError
 	}
 	if cubbyResp != nil && cubbyResp.IsError() {
-		c.tokenStore.Revoke(te.ID)
-		c.logger.Error("core: failed to store wrapped response information", "error", cubbyResp.Data["error"])
+		c.tokenStore.revokeOrphan(ctx, te.ID)
+		c.logger.Error("failed to store wrapped response information", "error", cubbyResp.Data["error"])
 		return cubbyResp, nil
 	}
 
@@ -225,16 +236,16 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 	} else {
 		cubbyReq.Data["creation_path"] = resp.WrapInfo.CreationPath
 	}
-	cubbyResp, err = c.router.Route(cubbyReq)
+	cubbyResp, err = c.router.Route(ctx, cubbyReq)
 	if err != nil {
 		// Revoke since it's not yet being tracked for expiration
-		c.tokenStore.Revoke(te.ID)
-		c.logger.Error("core: failed to store wrapping information", "error", err)
+		c.tokenStore.revokeOrphan(ctx, te.ID)
+		c.logger.Error("failed to store wrapping information", "error", err)
 		return nil, ErrInternalError
 	}
 	if cubbyResp != nil && cubbyResp.IsError() {
-		c.tokenStore.Revoke(te.ID)
-		c.logger.Error("core: failed to store wrapping information", "error", cubbyResp.Data["error"])
+		c.tokenStore.revokeOrphan(ctx, te.ID)
+		c.logger.Error("failed to store wrapping information", "error", cubbyResp.Data["error"])
 		return cubbyResp, nil
 	}
 
@@ -248,10 +259,10 @@ func (c *Core) wrapInCubbyhole(req *logical.Request, resp *logical.Response, aut
 	}
 
 	// Register the wrapped token with the expiration manager
-	if err := c.expiration.RegisterAuth(te.Path, wAuth); err != nil {
+	if err := c.expiration.RegisterAuth(ctx, te.Path, wAuth); err != nil {
 		// Revoke since it's not yet being tracked for expiration
-		c.tokenStore.Revoke(te.ID)
-		c.logger.Error("core: failed to register cubbyhole wrapping token lease", "request_path", req.Path, "error", err)
+		c.tokenStore.revokeOrphan(ctx, te.ID)
+		c.logger.Error("failed to register cubbyhole wrapping token lease", "request_path", req.Path, "error", err)
 		return nil, ErrInternalError
 	}
 
@@ -308,16 +319,17 @@ func (c *Core) ValidateWrappingToken(req *logical.Request) (bool, error) {
 		return false, fmt.Errorf("token is empty")
 	}
 
-	c.stateLock.RLock()
-	defer c.stateLock.RUnlock()
-	if c.sealed {
+	if c.Sealed() {
 		return false, consts.ErrSealed
 	}
+
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
 	if c.standby {
 		return false, consts.ErrStandby
 	}
 
-	te, err := c.tokenStore.Lookup(token)
+	te, err := c.tokenStore.Lookup(c.activeContext, token)
 	if err != nil {
 		return false, err
 	}

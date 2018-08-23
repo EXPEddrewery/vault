@@ -1,16 +1,16 @@
 package aws
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"regexp"
 	"time"
 
-	"strings"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
@@ -64,10 +64,10 @@ func genUsername(displayName, policyName, userType string) (ret string, warning 
 	return
 }
 
-func (b *backend) secretTokenCreate(s logical.Storage,
+func (b *backend) secretTokenCreate(ctx context.Context, s logical.Storage,
 	displayName, policyName, policy string,
 	lifeTimeInSeconds int64) (*logical.Response, error) {
-	STSClient, err := clientSTS(s)
+	STSClient, err := clientSTS(ctx, s)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
@@ -109,22 +109,25 @@ func (b *backend) secretTokenCreate(s logical.Storage,
 	return resp, nil
 }
 
-func (b *backend) assumeRole(s logical.Storage,
-	displayName, policyName, policy string,
+func (b *backend) assumeRole(ctx context.Context, s logical.Storage,
+	displayName, roleName, roleArn, policy string,
 	lifeTimeInSeconds int64) (*logical.Response, error) {
-	STSClient, err := clientSTS(s)
+	STSClient, err := clientSTS(ctx, s)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	username, usernameWarning := genUsername(displayName, policyName, "iam_user")
+	username, usernameWarning := genUsername(displayName, roleName, "iam_user")
 
-	tokenResp, err := STSClient.AssumeRole(
-		&sts.AssumeRoleInput{
-			RoleSessionName: aws.String(username),
-			RoleArn:         aws.String(policy),
-			DurationSeconds: &lifeTimeInSeconds,
-		})
+	assumeRoleInput := &sts.AssumeRoleInput{
+		RoleSessionName: aws.String(username),
+		RoleArn:         aws.String(roleArn),
+		DurationSeconds: &lifeTimeInSeconds,
+	}
+	if policy != "" {
+		assumeRoleInput.SetPolicy(policy)
+	}
+	tokenResp, err := STSClient.AssumeRole(assumeRoleInput)
 
 	if err != nil {
 		return logical.ErrorResponse(fmt.Sprintf(
@@ -137,7 +140,7 @@ func (b *backend) assumeRole(s logical.Storage,
 		"security_token": *tokenResp.Credentials.SessionToken,
 	}, map[string]interface{}{
 		"username": username,
-		"policy":   policy,
+		"policy":   roleArn,
 		"is_sts":   true,
 	})
 
@@ -155,9 +158,10 @@ func (b *backend) assumeRole(s logical.Storage,
 }
 
 func (b *backend) secretAccessKeysCreate(
+	ctx context.Context,
 	s logical.Storage,
-	displayName, policyName string, policy string) (*logical.Response, error) {
-	client, err := clientIAM(s)
+	displayName, policyName string, role *awsRoleEntry) (*logical.Response, error) {
+	client, err := clientIAM(ctx, s)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}
@@ -168,11 +172,11 @@ func (b *backend) secretAccessKeysCreate(
 	// the user is created because if switch the order then the WAL put
 	// can fail, which would put us in an awkward position: we have a user
 	// we need to rollback but can't put the WAL entry to do the rollback.
-	walId, err := framework.PutWAL(s, "user", &walUser{
+	walId, err := framework.PutWAL(ctx, s, "user", &walUser{
 		UserName: username,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Error writing WAL entry: %s", err)
+		return nil, errwrap.Wrapf("error writing WAL entry: {{err}}", err)
 	}
 
 	// Create the user
@@ -184,23 +188,24 @@ func (b *backend) secretAccessKeysCreate(
 			"Error creating IAM user: %s", err)), nil
 	}
 
-	if strings.HasPrefix(policy, "arn:") {
+	for _, arn := range role.PolicyArns {
 		// Attach existing policy against user
 		_, err = client.AttachUserPolicy(&iam.AttachUserPolicyInput{
 			UserName:  aws.String(username),
-			PolicyArn: aws.String(policy),
+			PolicyArn: aws.String(arn),
 		})
 		if err != nil {
 			return logical.ErrorResponse(fmt.Sprintf(
 				"Error attaching user policy: %s", err)), nil
 		}
 
-	} else {
+	}
+	if role.PolicyDocument != "" {
 		// Add new inline user policy against user
 		_, err = client.PutUserPolicy(&iam.PutUserPolicyInput{
 			UserName:       aws.String(username),
 			PolicyName:     aws.String(policyName),
-			PolicyDocument: aws.String(policy),
+			PolicyDocument: aws.String(role.PolicyDocument),
 		})
 		if err != nil {
 			return logical.ErrorResponse(fmt.Sprintf(
@@ -220,8 +225,8 @@ func (b *backend) secretAccessKeysCreate(
 	// Remove the WAL entry, we succeeded! If we fail, we don't return
 	// the secret because it'll get rolled back anyways, so we have to return
 	// an error here.
-	if err := framework.DeleteWAL(s, walId); err != nil {
-		return nil, fmt.Errorf("Failed to commit WAL entry: %s", err)
+	if err := framework.DeleteWAL(ctx, s, walId); err != nil {
+		return nil, errwrap.Wrapf("failed to commit WAL entry: {{err}}", err)
 	}
 
 	// Return the info!
@@ -231,16 +236,17 @@ func (b *backend) secretAccessKeysCreate(
 		"security_token": nil,
 	}, map[string]interface{}{
 		"username": username,
-		"policy":   policy,
+		"policy":   role,
 		"is_sts":   false,
 	})
 
-	lease, err := b.Lease(s)
+	lease, err := b.Lease(ctx, s)
 	if err != nil || lease == nil {
 		lease = &configLease{}
 	}
 
 	resp.Secret.TTL = lease.Lease
+	resp.Secret.MaxTTL = lease.LeaseMax
 
 	if usernameWarning != "" {
 		resp.AddWarning(usernameWarning)
@@ -249,9 +255,7 @@ func (b *backend) secretAccessKeysCreate(
 	return resp, nil
 }
 
-func (b *backend) secretAccessKeysRenew(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-
+func (b *backend) secretAccessKeysRenew(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	// STS already has a lifetime, and we don't support renewing it
 	isSTSRaw, ok := req.Secret.InternalData["is_sts"]
 	if ok {
@@ -263,7 +267,7 @@ func (b *backend) secretAccessKeysRenew(
 		}
 	}
 
-	lease, err := b.Lease(req.Storage)
+	lease, err := b.Lease(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
@@ -271,12 +275,13 @@ func (b *backend) secretAccessKeysRenew(
 		lease = &configLease{}
 	}
 
-	f := framework.LeaseExtend(lease.Lease, lease.LeaseMax, b.System())
-	return f(req, d)
+	resp := &logical.Response{Secret: req.Secret}
+	resp.Secret.TTL = lease.Lease
+	resp.Secret.MaxTTL = lease.LeaseMax
+	return resp, nil
 }
 
-func secretAccessKeysRevoke(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func secretAccessKeysRevoke(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 
 	// STS cleans up after itself so we can skip this if is_sts internal data
 	// element set to true. If is_sts is not set, assumes old version
@@ -304,7 +309,7 @@ func secretAccessKeysRevoke(
 	}
 
 	// Use the user rollback mechanism to delete this user
-	err := pathUserRollback(req, "user", map[string]interface{}{
+	err := pathUserRollback(ctx, req, "user", map[string]interface{}{
 		"username": username,
 	})
 	if err != nil {

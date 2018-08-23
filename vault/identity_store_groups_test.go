@@ -1,10 +1,12 @@
 package vault
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"testing"
 
+	"github.com/go-test/deep"
 	"github.com/hashicorp/vault/helper/identity"
 	"github.com/hashicorp/vault/logical"
 )
@@ -23,7 +25,7 @@ func TestIdentityStore_Groups_TypeMembershipAdditions(t *testing.T) {
 		},
 	}
 
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +38,7 @@ func TestIdentityStore_Groups_TypeMembershipAdditions(t *testing.T) {
 		"member_group_ids": "samplegroupid",
 	}
 
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +57,7 @@ func TestIdentityStore_Groups_TypeImmutability(t *testing.T) {
 		Operation: logical.UpdateOperation,
 	}
 
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -64,7 +66,7 @@ func TestIdentityStore_Groups_TypeImmutability(t *testing.T) {
 	groupReq.Data = map[string]interface{}{
 		"type": "external",
 	}
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -75,7 +77,7 @@ func TestIdentityStore_Groups_TypeImmutability(t *testing.T) {
 		"type": "external",
 	}
 	groupReq.Path = "group/id/" + internalGroupID
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +90,7 @@ func TestIdentityStore_Groups_TypeImmutability(t *testing.T) {
 		"type": "internal",
 	}
 	groupReq.Path = "group/id/" + externalGroupID
-	resp, err = i.HandleRequest(groupReq)
+	resp, err = i.HandleRequest(context.Background(), groupReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,10 +118,13 @@ func TestIdentityStore_MemDBGroupIndexes(t *testing.T) {
 	}
 
 	// Insert it into memdb
-	err = i.MemDBUpsertGroup(group)
+	txn := i.db.Txn(true)
+	defer txn.Abort()
+	err = i.MemDBUpsertGroupInTxn(txn, group)
 	if err != nil {
 		t.Fatal(err)
 	}
+	txn.Commit()
 
 	// Insert another dummy group
 	group = &identity.Group{
@@ -136,10 +141,14 @@ func TestIdentityStore_MemDBGroupIndexes(t *testing.T) {
 	}
 
 	// Insert it into memdb
-	err = i.MemDBUpsertGroup(group)
+
+	txn = i.db.Txn(true)
+	defer txn.Abort()
+	err = i.MemDBUpsertGroupInTxn(txn, group)
 	if err != nil {
 		t.Fatal(err)
 	}
+	txn.Commit()
 
 	var fetchedGroup *identity.Group
 
@@ -179,23 +188,6 @@ func TestIdentityStore_MemDBGroupIndexes(t *testing.T) {
 		t.Fatalf("failed to fetch a indexed groups")
 	}
 
-	// Fetch groups based on policy name
-	fetchedGroups, err = i.MemDBGroupsByPolicy("testpolicy1", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fetchedGroups) != 1 || fetchedGroups[0].Name != "testgroupname" {
-		t.Fatalf("failed to fetch an indexed group")
-	}
-
-	fetchedGroups, err = i.MemDBGroupsByPolicy("testpolicy2", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fetchedGroups) != 2 {
-		t.Fatalf("failed to fetch indexed groups")
-	}
-
 	// Fetch groups based on member entity ID
 	fetchedGroups, err = i.MemDBGroupsByMemberEntityID("testentityid1", false, false)
 	if err != nil {
@@ -225,14 +217,14 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 		Operation: logical.UpdateOperation,
 		Path:      "entity",
 	}
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 	entityID1 := resp.Data["id"].(string)
 
 	// Create another entity and get its ID
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -251,14 +243,14 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 		Path:      "group",
 		Data:      groupData,
 	}
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 	memberGroupID1 := resp.Data["id"].(string)
 
 	// Create another group and get its ID
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -266,7 +258,7 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 
 	// Create a group with the above 2 groups as its members
 	groupData["member_group_ids"] = []string{memberGroupID1, memberGroupID2}
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -278,7 +270,7 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 		Operation: logical.ReadOperation,
 		Path:      "group/id/" + groupID,
 	}
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -289,6 +281,7 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 			"testkey1": "testvalue1",
 			"testkey2": "testvalue2",
 		},
+		"parent_group_ids": []string(nil),
 	}
 	expectedData["id"] = resp.Data["id"]
 	expectedData["type"] = resp.Data["type"]
@@ -300,8 +293,8 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 	expectedData["modify_index"] = resp.Data["modify_index"]
 	expectedData["alias"] = resp.Data["alias"]
 
-	if !reflect.DeepEqual(expectedData, resp.Data) {
-		t.Fatalf("bad: group data;\nexpected: %#v\n actual: %#v\n", expectedData, resp.Data)
+	if diff := deep.Equal(expectedData, resp.Data); diff != nil {
+		t.Fatal(diff)
 	}
 
 	// Update the policies and metadata in the group
@@ -312,14 +305,14 @@ func TestIdentityStore_GroupsCreateUpdate(t *testing.T) {
 	groupData["id"] = groupID
 	groupData["policies"] = "updatedpolicy1,updatedpolicy2"
 	groupData["metadata"] = []string{"updatedkey=updatedvalue"}
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 
 	// Check if updates are reflected
 	groupReq.Operation = logical.ReadOperation
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -345,14 +338,14 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 		Operation: logical.UpdateOperation,
 		Path:      "entity",
 	}
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 	entityID1 := resp.Data["id"].(string)
 
 	// Create another entity and get its ID
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -371,14 +364,14 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 		Path:      "group",
 		Data:      groupData,
 	}
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 	memberGroupID1 := resp.Data["id"].(string)
 
 	// Create another group and get its ID
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -386,7 +379,7 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 
 	// Create a group with the above 2 groups as its members
 	groupData["member_group_ids"] = []string{memberGroupID1, memberGroupID2}
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -398,7 +391,7 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 		Operation: logical.ReadOperation,
 		Path:      "group/id/" + groupID,
 	}
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -409,6 +402,7 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 			"testkey1": "testvalue1",
 			"testkey2": "testvalue2",
 		},
+		"parent_group_ids": []string(nil),
 	}
 	expectedData["id"] = resp.Data["id"]
 	expectedData["type"] = resp.Data["type"]
@@ -420,8 +414,8 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 	expectedData["modify_index"] = resp.Data["modify_index"]
 	expectedData["alias"] = resp.Data["alias"]
 
-	if !reflect.DeepEqual(expectedData, resp.Data) {
-		t.Fatalf("bad: group data;\nexpected: %#v\n actual: %#v\n", expectedData, resp.Data)
+	if diff := deep.Equal(expectedData, resp.Data); diff != nil {
+		t.Fatal(diff)
 	}
 
 	// Update the policies and metadata in the group
@@ -429,14 +423,14 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 	groupReq.Data = groupData
 	groupData["policies"] = "updatedpolicy1,updatedpolicy2"
 	groupData["metadata"] = []string{"updatedkey=updatedvalue"}
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 
 	// Check if updates are reflected
 	groupReq.Operation = logical.ReadOperation
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -453,13 +447,13 @@ func TestIdentityStore_GroupsCRUD_ByID(t *testing.T) {
 
 	// Check if delete is working properly
 	groupReq.Operation = logical.DeleteOperation
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 
 	groupReq.Operation = logical.ReadOperation
-	resp, err = is.HandleRequest(groupReq)
+	resp, err = is.HandleRequest(context.Background(), groupReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +477,7 @@ func TestIdentityStore_GroupMultiCase(t *testing.T) {
 		"policies": "buildpolicy",
 	}
 	groupRegisterReq.Data = buildGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -495,7 +489,7 @@ func TestIdentityStore_GroupMultiCase(t *testing.T) {
 		"policies": "deploypolicy",
 	}
 	groupRegisterReq.Data = deployGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -506,7 +500,7 @@ func TestIdentityStore_GroupMultiCase(t *testing.T) {
 		Operation: logical.UpdateOperation,
 		Path:      "entity",
 	}
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -520,14 +514,14 @@ func TestIdentityStore_GroupMultiCase(t *testing.T) {
 			"member_entity_ids": []string{entityID1},
 		},
 	}
-	resp, err = is.HandleRequest(entityIDReq)
+	resp, err = is.HandleRequest(context.Background(), entityIDReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 
 	// Add the entity as a member of the 'deploy` group
 	entityIDReq.Path = "group/id/" + deployGroupID
-	resp, err = is.HandleRequest(entityIDReq)
+	resp, err = is.HandleRequest(context.Background(), entityIDReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -567,7 +561,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		"policies": "kubepolicy",
 	}
 	groupRegisterReq.Data = kubeGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -579,7 +573,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		"policies": "identitypolicy",
 	}
 	groupRegisterReq.Data = identityGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -591,7 +585,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		"policies": "buildpolicy",
 	}
 	groupRegisterReq.Data = buildGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -603,7 +597,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		"policies": "deploypolicy",
 	}
 	groupRegisterReq.Data = deployGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -617,7 +611,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		"member_group_ids": vaultMemberGroupIDs,
 	}
 	groupRegisterReq.Data = vaultGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -631,7 +625,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		"member_group_ids": opsMemberGroupIDs,
 	}
 	groupRegisterReq.Data = opsGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -646,7 +640,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 	}
 
 	groupRegisterReq.Data = engGroupData
-	resp, err = is.HandleRequest(groupRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), groupRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -714,7 +708,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 	groupUpdateReq.Path = "group/name/kube"
 	groupUpdateReq.Data = kubeGroupData
 	kubeGroupData["member_group_ids"] = []string{engGroupID}
-	resp, err = is.HandleRequest(groupUpdateReq)
+	resp, err = is.HandleRequest(context.Background(), groupUpdateReq)
 	if err == nil {
 		t.Fatalf("expected an error response")
 	}
@@ -724,7 +718,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 		Operation: logical.UpdateOperation,
 		Path:      "entity",
 	}
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -738,13 +732,13 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 			"member_entity_ids": []string{entityID1},
 		},
 	}
-	resp, err = is.HandleRequest(entityIDReq)
+	resp, err = is.HandleRequest(context.Background(), entityIDReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 
 	// Create a second entity ID
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -755,13 +749,13 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 	entityIDReq.Data = map[string]interface{}{
 		"member_entity_ids": []string{entityID2},
 	}
-	resp, err = is.HandleRequest(entityIDReq)
+	resp, err = is.HandleRequest(context.Background(), entityIDReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
 
 	// Create a third entity ID
-	resp, err = is.HandleRequest(entityRegisterReq)
+	resp, err = is.HandleRequest(context.Background(), entityRegisterReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}
@@ -772,7 +766,7 @@ func TestIdentityStore_GroupHierarchyCases(t *testing.T) {
 	entityIDReq.Data = map[string]interface{}{
 		"member_entity_ids": []string{entityID3},
 	}
-	resp, err = is.HandleRequest(entityIDReq)
+	resp, err = is.HandleRequest(context.Background(), entityIDReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("bad: resp: %#v, err: %v", resp, err)
 	}

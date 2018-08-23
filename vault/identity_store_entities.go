@@ -1,14 +1,17 @@
 package vault
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/golang/protobuf/ptypes"
+	"github.com/hashicorp/errwrap"
 	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/vault/helper/identity"
-	"github.com/hashicorp/vault/helper/locksutil"
 	"github.com/hashicorp/vault/helper/storagepacker"
+	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
@@ -43,9 +46,13 @@ vault <command> <path> metadata=key1=value1 metadata=key2=value2
 					Type:        framework.TypeCommaStringSlice,
 					Description: "Policies to be tied to the entity.",
 				},
+				"disabled": {
+					Type:        framework.TypeBool,
+					Description: "If set true, tokens tied to this identity will not be able to be used (but will not be revoked).",
+				},
 			},
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.UpdateOperation: i.pathEntityRegister,
+				logical.UpdateOperation: i.handleEntityUpdateCommon(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(entityHelp["entity"][0]),
@@ -74,11 +81,15 @@ vault <command> <path> metadata=key1=value1 metadata=key2=value2
 					Type:        framework.TypeCommaStringSlice,
 					Description: "Policies to be tied to the entity.",
 				},
+				"disabled": {
+					Type:        framework.TypeBool,
+					Description: "If set true, tokens tied to this identity will not be able to be used (but will not be revoked).",
+				},
 			},
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.UpdateOperation: i.pathEntityIDUpdate,
-				logical.ReadOperation:   i.pathEntityIDRead,
-				logical.DeleteOperation: i.pathEntityIDDelete,
+				logical.UpdateOperation: i.handleEntityUpdateCommon(),
+				logical.ReadOperation:   i.pathEntityIDRead(),
+				logical.DeleteOperation: i.pathEntityIDDelete(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-id"][0]),
@@ -87,7 +98,7 @@ vault <command> <path> metadata=key1=value1 metadata=key2=value2
 		{
 			Pattern: "entity/id/?$",
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.ListOperation: i.pathEntityIDList,
+				logical.ListOperation: i.pathEntityIDList(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-id-list"][0]),
@@ -110,7 +121,7 @@ vault <command> <path> metadata=key1=value1 metadata=key2=value2
 				},
 			},
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.UpdateOperation: i.pathEntityMergeID,
+				logical.UpdateOperation: i.pathEntityMergeID(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-merge-id"][0]),
@@ -120,301 +131,168 @@ vault <command> <path> metadata=key1=value1 metadata=key2=value2
 }
 
 // pathEntityMergeID merges two or more entities into a single entity
-func (i *IdentityStore) pathEntityMergeID(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	toEntityID := d.Get("to_entity_id").(string)
-	if toEntityID == "" {
-		return logical.ErrorResponse("missing entity id to merge to"), nil
-	}
-
-	fromEntityIDs := d.Get("from_entity_ids").([]string)
-	if len(fromEntityIDs) == 0 {
-		return logical.ErrorResponse("missing entity ids to merge from"), nil
-	}
-
-	force := d.Get("force").(bool)
-
-	toEntityForLocking, err := i.MemDBEntityByID(toEntityID, false)
-	if err != nil {
-		return nil, err
-	}
-
-	if toEntityForLocking == nil {
-		return logical.ErrorResponse("entity id to merge to is invalid"), nil
-	}
-
-	// Acquire the lock to modify the entity storage entry to merge to
-	toEntityLock := locksutil.LockForKey(i.entityLocks, toEntityForLocking.ID)
-	toEntityLock.Lock()
-	defer toEntityLock.Unlock()
-
-	// Create a MemDB transaction to merge entities
-	txn := i.db.Txn(true)
-	defer txn.Abort()
-
-	// Re-read post lock acquisition
-	toEntity, err := i.MemDBEntityByID(toEntityID, true)
-	if err != nil {
-		return nil, err
-	}
-
-	if toEntity == nil {
-		return logical.ErrorResponse("entity id to merge to is invalid"), nil
-	}
-
-	if toEntity.ID != toEntityForLocking.ID {
-		return logical.ErrorResponse("acquired lock for an undesired entity"), nil
-	}
-
-	var conflictErrors error
-	for _, fromEntityID := range fromEntityIDs {
-		if fromEntityID == toEntityID {
-			return logical.ErrorResponse("to_entity_id should not be present in from_entity_ids"), nil
+func (i *IdentityStore) pathEntityMergeID() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		toEntityID := d.Get("to_entity_id").(string)
+		if toEntityID == "" {
+			return logical.ErrorResponse("missing entity id to merge to"), nil
 		}
 
-		lockFromEntity, err := i.MemDBEntityByID(fromEntityID, false)
+		fromEntityIDs := d.Get("from_entity_ids").([]string)
+		if len(fromEntityIDs) == 0 {
+			return logical.ErrorResponse("missing entity ids to merge from"), nil
+		}
+
+		force := d.Get("force").(bool)
+
+		// Create a MemDB transaction to merge entities
+		txn := i.db.Txn(true)
+		defer txn.Abort()
+
+		toEntity, err := i.MemDBEntityByID(toEntityID, true)
 		if err != nil {
 			return nil, err
 		}
 
-		if lockFromEntity == nil {
-			return logical.ErrorResponse("entity id to merge from is invalid"), nil
+		userErr, intErr := i.mergeEntity(txn, toEntity, fromEntityIDs, force, true, false)
+		if userErr != nil {
+			return logical.ErrorResponse(userErr.Error()), nil
+		}
+		if intErr != nil {
+			return nil, intErr
 		}
 
-		// Acquire the lock to modify the entity storage entry to merge from
-		fromEntityLock := locksutil.LockForKey(i.entityLocks, lockFromEntity.ID)
+		// Committing the transaction *after* successfully performing storage
+		// persistence
+		txn.Commit()
 
-		fromLockHeld := false
-
-		// There are only 256 lock buckets and the chances of entity ID collision
-		// is fairly high. When we are merging entities belonging to the same
-		// bucket, multiple attempts to acquire the same lock should be avoided.
-		if fromEntityLock != toEntityLock {
-			fromEntityLock.Lock()
-			fromLockHeld = true
-		}
-
-		// Re-read the entities post lock acquisition
-		fromEntity, err := i.MemDBEntityByID(fromEntityID, false)
-		if err != nil {
-			if fromLockHeld {
-				fromEntityLock.Unlock()
-			}
-			return nil, err
-		}
-
-		if fromEntity == nil {
-			if fromLockHeld {
-				fromEntityLock.Unlock()
-			}
-			return logical.ErrorResponse("entity id to merge from is invalid"), nil
-		}
-
-		if fromEntity.ID != lockFromEntity.ID {
-			if fromLockHeld {
-				fromEntityLock.Unlock()
-			}
-			return logical.ErrorResponse("acquired lock for an undesired entity"), nil
-		}
-
-		for _, alias := range fromEntity.Aliases {
-			// Set the desired canonical ID
-			alias.CanonicalID = toEntity.ID
-
-			alias.MergedFromCanonicalIDs = append(alias.MergedFromCanonicalIDs, fromEntity.ID)
-
-			err = i.MemDBUpsertAliasInTxn(txn, alias, false)
-			if err != nil {
-				if fromLockHeld {
-					fromEntityLock.Unlock()
-				}
-				return nil, fmt.Errorf("failed to update alias during merge: %v", err)
-			}
-
-			// Add the alias to the desired entity
-			toEntity.Aliases = append(toEntity.Aliases, alias)
-		}
-
-		// If the entity from which we are merging from was already a merged
-		// entity, transfer over the Merged set to the entity we are
-		// merging into.
-		toEntity.MergedEntityIDs = append(toEntity.MergedEntityIDs, fromEntity.MergedEntityIDs...)
-
-		// Add the entity from which we are merging from to the list of entities
-		// the entity we are merging into is composed of.
-		toEntity.MergedEntityIDs = append(toEntity.MergedEntityIDs, fromEntity.ID)
-
-		// Delete the entity which we are merging from in MemDB using the same transaction
-		err = i.MemDBDeleteEntityByIDInTxn(txn, fromEntity.ID)
-		if err != nil {
-			if fromLockHeld {
-				fromEntityLock.Unlock()
-			}
-			return nil, err
-		}
-
-		// Delete the entity which we are merging from in storage
-		err = i.entityPacker.DeleteItem(fromEntity.ID)
-		if err != nil {
-			if fromLockHeld {
-				fromEntityLock.Unlock()
-			}
-			return nil, err
-		}
-
-		if fromLockHeld {
-			fromEntityLock.Unlock()
-		}
+		return nil, nil
 	}
-
-	if conflictErrors != nil && !force {
-		return logical.ErrorResponse(conflictErrors.Error()), nil
-	}
-
-	// Update MemDB with changes to the entity we are merging to
-	err = i.MemDBUpsertEntityInTxn(txn, toEntity)
-	if err != nil {
-		return nil, err
-	}
-
-	// Persist the entity which we are merging to
-	toEntityAsAny, err := ptypes.MarshalAny(toEntity)
-	if err != nil {
-		return nil, err
-	}
-	item := &storagepacker.Item{
-		ID:      toEntity.ID,
-		Message: toEntityAsAny,
-	}
-
-	err = i.entityPacker.PutItem(item)
-	if err != nil {
-		return nil, err
-	}
-
-	// Committing the transaction *after* successfully performing storage
-	// persistence
-	txn.Commit()
-
-	return nil, nil
-}
-
-// pathEntityRegister is used to register a new entity
-func (i *IdentityStore) pathEntityRegister(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	_, ok := d.GetOk("id")
-	if ok {
-		return i.pathEntityIDUpdate(req, d)
-	}
-
-	return i.handleEntityUpdateCommon(req, d, nil)
-}
-
-// pathEntityIDUpdate is used to update an entity based on the given entity ID
-func (i *IdentityStore) pathEntityIDUpdate(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	// Get entity id
-	entityID := d.Get("id").(string)
-
-	if entityID == "" {
-		return logical.ErrorResponse("missing entity id"), nil
-	}
-
-	entity, err := i.MemDBEntityByID(entityID, true)
-	if err != nil {
-		return nil, err
-	}
-	if entity == nil {
-		return nil, fmt.Errorf("invalid entity id")
-	}
-
-	return i.handleEntityUpdateCommon(req, d, entity)
 }
 
 // handleEntityUpdateCommon is used to update an entity
-func (i *IdentityStore) handleEntityUpdateCommon(req *logical.Request, d *framework.FieldData, entity *identity.Entity) (*logical.Response, error) {
-	var err error
-	var newEntity bool
+func (i *IdentityStore) handleEntityUpdateCommon() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		i.lock.Lock()
+		defer i.lock.Unlock()
 
-	// Entity will be nil when a new entity is being registered; create a new
-	// struct in that case.
-	if entity == nil {
-		entity = &identity.Entity{}
-		newEntity = true
-	}
+		var entity *identity.Entity
+		var err error
 
-	// Update the policies if supplied
-	entityPoliciesRaw, ok := d.GetOk("policies")
-	if ok {
-		entity.Policies = entityPoliciesRaw.([]string)
-	}
+		entityID := d.Get("id").(string)
+		if entityID != "" {
+			entity, err = i.MemDBEntityByID(entityID, true)
+			if err != nil {
+				return nil, err
+			}
+			if entity == nil {
+				return logical.ErrorResponse("entity not found from id"), nil
+			}
+		}
 
-	// Get the name
-	entityName := d.Get("name").(string)
-	if entityName != "" {
-		entityByName, err := i.MemDBEntityByName(entityName, false)
+		// Get the name
+		entityName := d.Get("name").(string)
+		if entityName != "" {
+			entityByName, err := i.MemDBEntityByName(entityName, false)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case entityByName == nil:
+				// Not found, safe to use this name with an existing or new entity
+			case entity == nil:
+				// We found an entity by name, but we don't currently allow
+				// updating based on name, only ID, so return an error
+				return logical.ErrorResponse("entity name is already in use"), nil
+			case entity.ID == entityByName.ID:
+				// Same exact entity, carry on (this is basically a noop then)
+			default:
+				return logical.ErrorResponse("entity name is already in use"), nil
+			}
+		}
+
+		// Entity will be nil when a new entity is being registered; create a new
+		// struct in that case.
+		if entity == nil {
+			entity = &identity.Entity{}
+		}
+		if entityName != "" {
+			entity.Name = entityName
+		}
+
+		// Update the policies if supplied
+		entityPoliciesRaw, ok := d.GetOk("policies")
+		if ok {
+			entity.Policies = entityPoliciesRaw.([]string)
+		}
+
+		if strutil.StrListContains(entity.Policies, "root") {
+			return logical.ErrorResponse("policies cannot contain root"), nil
+		}
+
+		disabledRaw, ok := d.GetOk("disabled")
+		if ok {
+			entity.Disabled = disabledRaw.(bool)
+		}
+
+		// Get entity metadata
+		metadata, ok, err := d.GetOkErr("metadata")
+		if err != nil {
+			return logical.ErrorResponse(fmt.Sprintf("failed to parse metadata: %v", err)), nil
+		}
+		if ok {
+			entity.Metadata = metadata.(map[string]string)
+		}
+		// ID creation and some validations
+		err = i.sanitizeEntity(entity)
 		if err != nil {
 			return nil, err
 		}
-		switch {
-		case (newEntity && entityByName != nil), (entityByName != nil && entity.ID != "" && entityByName.ID != entity.ID):
-			return logical.ErrorResponse("entity name is already in use"), nil
+
+		// Prepare the response
+		respData := map[string]interface{}{
+			"id": entity.ID,
 		}
-		entity.Name = entityName
-	}
 
-	// Get entity metadata
-	metadata, ok, err := d.GetOkErr("metadata")
-	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("failed to parse metadata: %v", err)), nil
-	}
-	if ok {
-		entity.Metadata = metadata.(map[string]string)
-	}
-	// ID creation and some validations
-	err = i.sanitizeEntity(entity)
-	if err != nil {
-		return nil, err
-	}
+		var aliasIDs []string
+		for _, alias := range entity.Aliases {
+			aliasIDs = append(aliasIDs, alias.ID)
+		}
 
-	// Prepare the response
-	respData := map[string]interface{}{
-		"id": entity.ID,
+		respData["aliases"] = aliasIDs
+
+		// Update MemDB and persist entity object. New entities have not been
+		// looked up yet so we need to take the lock on the entity on upsert
+		if err := i.upsertEntity(entity, nil, true); err != nil {
+			return nil, err
+		}
+
+		// Return ID of the entity that was either created or updated along with
+		// its aliases
+		return &logical.Response{
+			Data: respData,
+		}, nil
 	}
-
-	var aliasIDs []string
-	for _, alias := range entity.Aliases {
-		aliasIDs = append(aliasIDs, alias.ID)
-	}
-
-	respData["aliases"] = aliasIDs
-
-	// Update MemDB and persist entity object
-	err = i.upsertEntity(entity, nil, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return ID of the entity that was either created or updated along with
-	// its aliases
-	return &logical.Response{
-		Data: respData,
-	}, nil
 }
 
 // pathEntityIDRead returns the properties of an entity for a given entity ID
-func (i *IdentityStore) pathEntityIDRead(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	entityID := d.Get("id").(string)
-	if entityID == "" {
-		return logical.ErrorResponse("missing entity id"), nil
-	}
+func (i *IdentityStore) pathEntityIDRead() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityID := d.Get("id").(string)
+		if entityID == "" {
+			return logical.ErrorResponse("missing entity id"), nil
+		}
 
-	entity, err := i.MemDBEntityByID(entityID, false)
-	if err != nil {
-		return nil, err
-	}
-	if entity == nil {
-		return nil, nil
-	}
+		entity, err := i.MemDBEntityByID(entityID, false)
+		if err != nil {
+			return nil, err
+		}
+		if entity == nil {
+			return nil, nil
+		}
 
-	return i.handleEntityReadCommon(entity)
+		return i.handleEntityReadCommon(entity)
+	}
 }
 
 func (i *IdentityStore) handleEntityReadCommon(entity *identity.Entity) (*logical.Response, error) {
@@ -424,6 +302,7 @@ func (i *IdentityStore) handleEntityReadCommon(entity *identity.Entity) (*logica
 	respData["metadata"] = entity.Metadata
 	respData["merged_entity_ids"] = entity.MergedEntityIDs
 	respData["policies"] = entity.Policies
+	respData["disabled"] = entity.Disabled
 
 	// Convert protobuf timestamp into RFC3339 format
 	respData["creation_time"] = ptypes.TimestampString(entity.CreationTime)
@@ -435,14 +314,18 @@ func (i *IdentityStore) handleEntityReadCommon(entity *identity.Entity) (*logica
 		aliasMap := map[string]interface{}{}
 		aliasMap["id"] = alias.ID
 		aliasMap["canonical_id"] = alias.CanonicalID
-		aliasMap["mount_type"] = alias.MountType
 		aliasMap["mount_accessor"] = alias.MountAccessor
-		aliasMap["mount_path"] = alias.MountPath
 		aliasMap["metadata"] = alias.Metadata
 		aliasMap["name"] = alias.Name
 		aliasMap["merged_from_canonical_ids"] = alias.MergedFromCanonicalIDs
 		aliasMap["creation_time"] = ptypes.TimestampString(alias.CreationTime)
 		aliasMap["last_update_time"] = ptypes.TimestampString(alias.LastUpdateTime)
+
+		if mountValidationResp := i.core.router.validateMountByAccessor(alias.MountAccessor); mountValidationResp != nil {
+			aliasMap["mount_type"] = mountValidationResp.MountType
+			aliasMap["mount_path"] = mountValidationResp.MountPath
+		}
+
 		aliasesToReturn[aliasIdx] = aliasMap
 	}
 
@@ -476,34 +359,214 @@ func (i *IdentityStore) handleEntityReadCommon(entity *identity.Entity) (*logica
 }
 
 // pathEntityIDDelete deletes the entity for a given entity ID
-func (i *IdentityStore) pathEntityIDDelete(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	entityID := d.Get("id").(string)
-	if entityID == "" {
-		return logical.ErrorResponse("missing entity id"), nil
-	}
+func (i *IdentityStore) pathEntityIDDelete() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityID := d.Get("id").(string)
+		if entityID == "" {
+			return logical.ErrorResponse("missing entity id"), nil
+		}
 
-	return nil, i.deleteEntity(entityID)
+		i.lock.Lock()
+		defer i.lock.Unlock()
+
+		// Create a MemDB transaction to delete entity
+		txn := i.db.Txn(true)
+		defer txn.Abort()
+
+		// Fetch the entity using its ID
+		entity, err := i.MemDBEntityByIDInTxn(txn, entityID, true)
+		if err != nil {
+			return nil, err
+		}
+
+		// If there is no entity for the ID, do nothing
+		if entity == nil {
+			return nil, nil
+		}
+
+		// Delete all the aliases in the entity. This function will also remove
+		// the corresponding alias indexes too.
+		err = i.deleteAliasesInEntityInTxn(txn, entity, entity.Aliases)
+		if err != nil {
+			return nil, err
+		}
+
+		// Delete the entity using the same transaction
+		err = i.MemDBDeleteEntityByIDInTxn(txn, entity.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Delete the entity from storage
+		err = i.entityPacker.DeleteItem(entity.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Committing the transaction *after* successfully deleting entity
+		txn.Commit()
+
+		return nil, nil
+	}
 }
 
 // pathEntityIDList lists the IDs of all the valid entities in the identity
 // store
-func (i *IdentityStore) pathEntityIDList(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	ws := memdb.NewWatchSet()
-	iter, err := i.MemDBEntities(ws)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch iterator for entities in memdb: %v", err)
-	}
+func (i *IdentityStore) pathEntityIDList() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		ws := memdb.NewWatchSet()
 
-	var entityIDs []string
-	for {
-		raw := iter.Next()
-		if raw == nil {
-			break
+		txn := i.db.Txn(false)
+
+		iter, err := txn.Get(entitiesTable, "id")
+		if err != nil {
+			return nil, errwrap.Wrapf("failed to fetch iterator for entities in memdb: {{err}}", err)
 		}
-		entityIDs = append(entityIDs, raw.(*identity.Entity).ID)
+
+		ws.Add(iter.WatchCh())
+
+		var entityIDs []string
+		entityInfo := map[string]interface{}{}
+
+		type mountInfo struct {
+			MountType string
+			MountPath string
+		}
+		mountAccessorMap := map[string]mountInfo{}
+
+		for {
+			raw := iter.Next()
+			if raw == nil {
+				break
+			}
+			entity := raw.(*identity.Entity)
+			entityIDs = append(entityIDs, entity.ID)
+			entityInfoEntry := map[string]interface{}{
+				"name": entity.Name,
+			}
+			if len(entity.Aliases) > 0 {
+				aliasList := make([]interface{}, 0, len(entity.Aliases))
+				for _, alias := range entity.Aliases {
+					entry := map[string]interface{}{
+						"id":             alias.ID,
+						"name":           alias.Name,
+						"mount_accessor": alias.MountAccessor,
+					}
+
+					mi, ok := mountAccessorMap[alias.MountAccessor]
+					if ok {
+						entry["mount_type"] = mi.MountType
+						entry["mount_path"] = mi.MountPath
+					} else {
+						mi = mountInfo{}
+						if mountValidationResp := i.core.router.validateMountByAccessor(alias.MountAccessor); mountValidationResp != nil {
+							mi.MountType = mountValidationResp.MountType
+							mi.MountPath = mountValidationResp.MountPath
+							entry["mount_type"] = mi.MountType
+							entry["mount_path"] = mi.MountPath
+						}
+						mountAccessorMap[alias.MountAccessor] = mi
+					}
+
+					aliasList = append(aliasList, entry)
+				}
+				entityInfoEntry["aliases"] = aliasList
+			}
+			entityInfo[entity.ID] = entityInfoEntry
+		}
+
+		return logical.ListResponseWithInfo(entityIDs, entityInfo), nil
+	}
+}
+
+func (i *IdentityStore) mergeEntity(txn *memdb.Txn, toEntity *identity.Entity, fromEntityIDs []string, force, grabLock, mergePolicies bool) (error, error) {
+	if grabLock {
+		i.lock.Lock()
+		defer i.lock.Unlock()
 	}
 
-	return logical.ListResponse(entityIDs), nil
+	if toEntity == nil {
+		return errors.New("entity id to merge to is invalid"), nil
+	}
+
+	for _, fromEntityID := range fromEntityIDs {
+		if fromEntityID == toEntity.ID {
+			return errors.New("to_entity_id should not be present in from_entity_ids"), nil
+		}
+
+		fromEntity, err := i.MemDBEntityByID(fromEntityID, false)
+		if err != nil {
+			return nil, err
+		}
+
+		if fromEntity == nil {
+			return errors.New("entity id to merge from is invalid"), nil
+		}
+
+		for _, alias := range fromEntity.Aliases {
+			// Set the desired canonical ID
+			alias.CanonicalID = toEntity.ID
+
+			alias.MergedFromCanonicalIDs = append(alias.MergedFromCanonicalIDs, fromEntity.ID)
+
+			err = i.MemDBUpsertAliasInTxn(txn, alias, false)
+			if err != nil {
+				return nil, errwrap.Wrapf("failed to update alias during merge: {{err}}", err)
+			}
+
+			// Add the alias to the desired entity
+			toEntity.Aliases = append(toEntity.Aliases, alias)
+		}
+
+		// If told to, merge policies
+		if mergePolicies {
+			toEntity.Policies = strutil.MergeSlices(toEntity.Policies, fromEntity.Policies)
+		}
+
+		// If the entity from which we are merging from was already a merged
+		// entity, transfer over the Merged set to the entity we are
+		// merging into.
+		toEntity.MergedEntityIDs = append(toEntity.MergedEntityIDs, fromEntity.MergedEntityIDs...)
+
+		// Add the entity from which we are merging from to the list of entities
+		// the entity we are merging into is composed of.
+		toEntity.MergedEntityIDs = append(toEntity.MergedEntityIDs, fromEntity.ID)
+
+		// Delete the entity which we are merging from in MemDB using the same transaction
+		err = i.MemDBDeleteEntityByIDInTxn(txn, fromEntity.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Delete the entity which we are merging from in storage
+		err = i.entityPacker.DeleteItem(fromEntity.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Update MemDB with changes to the entity we are merging to
+	err := i.MemDBUpsertEntityInTxn(txn, toEntity)
+	if err != nil {
+		return nil, err
+	}
+
+	// Persist the entity which we are merging to
+	toEntityAsAny, err := ptypes.MarshalAny(toEntity)
+	if err != nil {
+		return nil, err
+	}
+	item := &storagepacker.Item{
+		ID:      toEntity.ID,
+		Message: toEntityAsAny,
+	}
+
+	err = i.entityPacker.PutItem(item)
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
 }
 
 var entityHelp = map[string][2]string{

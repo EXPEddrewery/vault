@@ -297,6 +297,7 @@ var (
 	TimeoutError        = newError(408, "Timeout when reading or writing data")
 	Forbidden           = newError(403, "Operation forbidden")
 	TooLargeObject      = newError(413, "Too Large Object")
+	RateLimit           = newError(498, "Rate Limit")
 
 	// Mappings for authentication errors
 	authErrorMap = errorMap{
@@ -311,6 +312,7 @@ var (
 		403: Forbidden,
 		404: ContainerNotFound,
 		409: ContainerNotEmpty,
+		498: RateLimit,
 	}
 
 	// Mappings for object errors
@@ -321,6 +323,7 @@ var (
 		404: ObjectNotFound,
 		413: TooLargeObject,
 		422: ObjectCorrupted,
+		498: RateLimit,
 	}
 )
 
@@ -1840,14 +1843,16 @@ type BulkDeleteResult struct {
 func (c *Connection) doBulkDelete(objects []string) (result BulkDeleteResult, err error) {
 	var buffer bytes.Buffer
 	for _, s := range objects {
-		buffer.WriteString(url.QueryEscape(s) + "\n")
+		u := url.URL{Path: s}
+		buffer.WriteString(u.String() + "\n")
 	}
 	resp, headers, err := c.storage(RequestOpts{
 		Operation:  "DELETE",
 		Parameters: url.Values{"bulk-delete": []string{"1"}},
 		Headers: Headers{
-			"Accept":       "application/json",
-			"Content-Type": "text/plain",
+			"Accept":         "application/json",
+			"Content-Type":   "text/plain",
+			"Content-Length": strconv.Itoa(buffer.Len()),
 		},
 		ErrorMap: ContainerErrorMap,
 		Body:     &buffer,

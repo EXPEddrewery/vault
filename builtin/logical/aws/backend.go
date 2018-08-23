@@ -1,16 +1,18 @@
 package aws
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
 
-func Factory(conf *logical.BackendConfig) (logical.Backend, error) {
+func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
 	b := Backend()
-	if err := b.Setup(conf); err != nil {
+	if err := b.Setup(ctx, conf); err != nil {
 		return nil, err
 	}
 	return b, nil
@@ -33,17 +35,16 @@ func Backend() *backend {
 		Paths: []*framework.Path{
 			pathConfigRoot(),
 			pathConfigLease(&b),
-			pathRoles(),
+			pathRoles(&b),
 			pathListRoles(&b),
 			pathUser(&b),
-			pathSTS(&b),
 		},
 
 		Secrets: []*framework.Secret{
 			secretAccessKeys(&b),
 		},
 
-		WALRollback:       walRollback,
+		WALRollback:       b.walRollback,
 		WALRollbackMinAge: 5 * time.Minute,
 		BackendType:       logical.TypeLogical,
 	}
@@ -53,6 +54,9 @@ func Backend() *backend {
 
 type backend struct {
 	*framework.Backend
+
+	// Mutex to protect access to reading and writing policies
+	roleMutex sync.RWMutex
 }
 
 const backendHelp = `

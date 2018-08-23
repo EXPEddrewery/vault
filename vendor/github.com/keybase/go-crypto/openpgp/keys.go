@@ -118,7 +118,8 @@ func (e *Entity) primaryIdentity() *Identity {
 func (e *Entity) encryptionKey(now time.Time) (Key, bool) {
 	candidateSubkey := -1
 
-	// Iterate the keys to find the newest key
+	// Iterate the keys to find the newest, non-revoked key that can
+	// encrypt.
 	var maxTime time.Time
 	for i, subkey := range e.Subkeys {
 
@@ -172,13 +173,18 @@ func (e *Entity) encryptionKey(now time.Time) (Key, bool) {
 func (e *Entity) signingKey(now time.Time) (Key, bool) {
 	candidateSubkey := -1
 
+	// Iterate the keys to find the newest, non-revoked key that can
+	// sign.
+	var maxTime time.Time
 	for i, subkey := range e.Subkeys {
 		if (!subkey.Sig.FlagsValid || subkey.Sig.FlagSign) &&
 			subkey.PrivateKey.PrivateKey != nil &&
 			subkey.PublicKey.PubKeyAlgo.CanSign() &&
+			!subkey.Sig.KeyExpired(now) &&
 			subkey.Revocation == nil &&
-			!subkey.Sig.KeyExpired(now) {
+			(maxTime.IsZero() || subkey.Sig.CreationTime.After(maxTime)) {
 			candidateSubkey = i
+			maxTime = subkey.Sig.CreationTime
 			break
 		}
 	}
@@ -645,6 +651,15 @@ func addSubkey(e *Entity, packets *packet.Reader, pub *packet.PublicKey, priv *p
 			}
 		}
 	}
+
+	if subKey.Sig != nil {
+		if err := subKey.PublicKey.ErrorIfDeprecated(); err != nil {
+			// Key passed signature check but is deprecated.
+			subKey.Sig = nil
+			lastErr = err
+		}
+	}
+
 	if subKey.Sig != nil {
 		e.Subkeys = append(e.Subkeys, subKey)
 	} else {

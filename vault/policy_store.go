@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -8,8 +9,10 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/errwrap"
+	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/golang-lru"
 	"github.com/hashicorp/vault/helper/consts"
+	"github.com/hashicorp/vault/helper/identity"
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
 )
@@ -66,6 +69,13 @@ path "sys/capabilities-self" {
     capabilities = ["update"]
 }
 
+# Allow a token to look up its resultant ACL from all policies. This is useful
+# for UIs. It is an internal path because the format may change at any time
+# based on how the internal ACL features and capabilities change.
+path "sys/internal/ui/resultant-acl" {
+    capabilities = ["read"]
+}
+
 # Allow a token to renew a lease via lease_id in the request body; old path for
 # old clients, new path for newer
 path "sys/renew" {
@@ -106,16 +116,22 @@ path "sys/wrapping/unwrap" {
 
 # Allow general purpose tools
 path "sys/tools/hash" {
-	capabilities = ["update"]
+    capabilities = ["update"]
 }
 path "sys/tools/hash/*" {
-	capabilities = ["update"]
+    capabilities = ["update"]
 }
 path "sys/tools/random" {
-	capabilities = ["update"]
+    capabilities = ["update"]
 }
 path "sys/tools/random/*" {
-	capabilities = ["update"]
+    capabilities = ["update"]
+}
+
+# Allow checking the status of a Control Group request if the user has the
+# accessor
+path "sys/control-group/request" {
+    capabilities = ["update"]
 }
 `
 )
@@ -135,6 +151,7 @@ var (
 // PolicyStore is used to provide durable storage of policy, and to
 // manage ACLs associated with them.
 type PolicyStore struct {
+	core             *Core
 	aclView          *BarrierView
 	tokenPoliciesLRU *lru.TwoQueueCache
 	// This is used to ensure that writes to the store (acl/rgp) or to the egp
@@ -143,30 +160,35 @@ type PolicyStore struct {
 	modifyLock *sync.RWMutex
 	// Stores whether a token policy is ACL or RGP
 	policyTypeMap sync.Map
+	// logger is the server logger copied over from core
+	logger log.Logger
 }
 
 // PolicyEntry is used to store a policy by name
 type PolicyEntry struct {
-	Version int
-	Raw     string
-	Type    PolicyType
+	Version   int
+	Raw       string
+	Templated bool
+	Type      PolicyType
 }
 
 // NewPolicyStore creates a new PolicyStore that is backed
 // using a given view. It used used to durable store and manage named policy.
-func NewPolicyStore(baseView *BarrierView, system logical.SystemView) *PolicyStore {
+func NewPolicyStore(ctx context.Context, core *Core, baseView *BarrierView, system logical.SystemView, logger log.Logger) *PolicyStore {
 	ps := &PolicyStore{
 		aclView:    baseView.SubView(policyACLSubPath),
 		modifyLock: new(sync.RWMutex),
+		logger:     logger,
+		core:       core,
 	}
 	if !system.CachingDisabled() {
 		cache, _ := lru.New2Q(policyCacheSize)
 		ps.tokenPoliciesLRU = cache
 	}
 
-	keys, err := logical.CollectKeys(ps.aclView)
+	keys, err := logical.CollectKeys(ctx, ps.aclView)
 	if err != nil {
-		vlogger.Error("error collecting acl policy keys", "error", err)
+		ps.logger.Error("error collecting acl policy keys", "error", err)
 		return nil
 	}
 	for _, key := range keys {
@@ -179,22 +201,22 @@ func NewPolicyStore(baseView *BarrierView, system logical.SystemView) *PolicySto
 
 // setupPolicyStore is used to initialize the policy store
 // when the vault is being unsealed.
-func (c *Core) setupPolicyStore() error {
+func (c *Core) setupPolicyStore(ctx context.Context) error {
 	// Create the policy store
 	sysView := &dynamicSystemView{core: c}
-	c.policyStore = NewPolicyStore(c.systemBarrierView, sysView)
+	c.policyStore = NewPolicyStore(ctx, c, c.systemBarrierView, sysView, c.logger.ResetNamed("policy"))
 
-	if c.replicationState.HasState(consts.ReplicationPerformanceSecondary) {
+	if c.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) {
 		// Policies will sync from the primary
 		return nil
 	}
 
 	// Ensure that the default policy exists, and if not, create it
-	if err := c.policyStore.loadACLPolicy(defaultPolicyName, defaultPolicy); err != nil {
+	if err := c.policyStore.loadACLPolicy(ctx, defaultPolicyName, defaultPolicy); err != nil {
 		return err
 	}
 	// Ensure that the response wrapping policy exists
-	if err := c.policyStore.loadACLPolicy(responseWrappingPolicyName, responseWrappingPolicy); err != nil {
+	if err := c.policyStore.loadACLPolicy(ctx, responseWrappingPolicyName, responseWrappingPolicy); err != nil {
 		return err
 	}
 
@@ -208,7 +230,7 @@ func (c *Core) teardownPolicyStore() error {
 	return nil
 }
 
-func (ps *PolicyStore) invalidate(name string, policyType PolicyType) {
+func (ps *PolicyStore) invalidate(ctx context.Context, name string, policyType PolicyType) {
 	// This may come with a prefixed "/" due to joining the file path
 	saneName := strings.TrimPrefix(name, "/")
 
@@ -226,14 +248,14 @@ func (ps *PolicyStore) invalidate(name string, policyType PolicyType) {
 	}
 
 	// Force a reload
-	_, err := ps.GetPolicy(name, policyType)
+	_, err := ps.GetPolicy(ctx, name, policyType)
 	if err != nil {
-		vlogger.Error("policy: error fetching policy after invalidation", "name", saneName)
+		ps.logger.Error("error fetching policy after invalidation", "name", saneName)
 	}
 }
 
 // SetPolicy is used to create or update the given policy
-func (ps *PolicyStore) SetPolicy(p *Policy) error {
+func (ps *PolicyStore) SetPolicy(ctx context.Context, p *Policy) error {
 	defer metrics.MeasureSince([]string{"policy", "set_policy"}, time.Now())
 	if p == nil {
 		return fmt.Errorf("nil policy passed in for storage")
@@ -244,27 +266,28 @@ func (ps *PolicyStore) SetPolicy(p *Policy) error {
 	// Policies are normalized to lower-case
 	p.Name = ps.sanitizeName(p.Name)
 	if strutil.StrListContains(immutablePolicies, p.Name) {
-		return fmt.Errorf("cannot update %s policy", p.Name)
+		return fmt.Errorf("cannot update %q policy", p.Name)
 	}
 
-	return ps.setPolicyInternal(p)
+	return ps.setPolicyInternal(ctx, p)
 }
 
-func (ps *PolicyStore) setPolicyInternal(p *Policy) error {
+func (ps *PolicyStore) setPolicyInternal(ctx context.Context, p *Policy) error {
 	ps.modifyLock.Lock()
 	defer ps.modifyLock.Unlock()
 	// Create the entry
 	entry, err := logical.StorageEntryJSON(p.Name, &PolicyEntry{
-		Version: 2,
-		Raw:     p.Raw,
-		Type:    p.Type,
+		Version:   2,
+		Raw:       p.Raw,
+		Type:      p.Type,
+		Templated: p.Templated,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create entry: %v", err)
+		return errwrap.Wrapf("failed to create entry: {{err}}", err)
 	}
 	switch p.Type {
 	case PolicyTypeACL:
-		if err := ps.aclView.Put(entry); err != nil {
+		if err := ps.aclView.Put(ctx, entry); err != nil {
 			return errwrap.Wrapf("failed to persist policy: {{err}}", err)
 		}
 		ps.policyTypeMap.Store(p.Name, PolicyTypeACL)
@@ -282,7 +305,7 @@ func (ps *PolicyStore) setPolicyInternal(p *Policy) error {
 }
 
 // GetPolicy is used to fetch the named policy
-func (ps *PolicyStore) GetPolicy(name string, policyType PolicyType) (*Policy, error) {
+func (ps *PolicyStore) GetPolicy(ctx context.Context, name string, policyType PolicyType) (*Policy, error) {
 	defer metrics.MeasureSince([]string{"policy", "get_policy"}, time.Now())
 
 	// Policies are normalized to lower-case
@@ -306,7 +329,7 @@ func (ps *PolicyStore) GetPolicy(name string, policyType PolicyType) (*Policy, e
 		case PolicyTypeACL:
 			view = ps.aclView
 		default:
-			return nil, fmt.Errorf("invalid type of policy in type map: %s", policyType)
+			return nil, fmt.Errorf("invalid type of policy in type map: %q", policyType)
 		}
 	}
 
@@ -336,7 +359,7 @@ func (ps *PolicyStore) GetPolicy(name string, policyType PolicyType) (*Policy, e
 		}
 	}
 
-	out, err := view.Get(name)
+	out, err := view.Get(ctx, name)
 	if err != nil {
 		return nil, errwrap.Wrapf("failed to read policy: {{err}}", err)
 	}
@@ -357,6 +380,7 @@ func (ps *PolicyStore) GetPolicy(name string, policyType PolicyType) (*Policy, e
 	policy.Name = name
 	policy.Raw = policyEntry.Raw
 	policy.Type = policyEntry.Type
+	policy.Templated = policyEntry.Templated
 	switch policyEntry.Type {
 	case PolicyTypeACL:
 		// Parse normally
@@ -383,7 +407,7 @@ func (ps *PolicyStore) GetPolicy(name string, policyType PolicyType) (*Policy, e
 }
 
 // ListPolicies is used to list the available policies
-func (ps *PolicyStore) ListPolicies(policyType PolicyType) ([]string, error) {
+func (ps *PolicyStore) ListPolicies(ctx context.Context, policyType PolicyType) ([]string, error) {
 	defer metrics.MeasureSince([]string{"policy", "list_policies"}, time.Now())
 	// Scan the view, since the policy names are the same as the
 	// key names.
@@ -391,9 +415,9 @@ func (ps *PolicyStore) ListPolicies(policyType PolicyType) ([]string, error) {
 	var err error
 	switch policyType {
 	case PolicyTypeACL:
-		keys, err = logical.CollectKeys(ps.aclView)
+		keys, err = logical.CollectKeys(ctx, ps.aclView)
 	default:
-		return nil, fmt.Errorf("unknown policy type %s", policyType)
+		return nil, fmt.Errorf("unknown policy type %q", policyType)
 	}
 
 	// We only have non-assignable ACL policies at the moment
@@ -417,7 +441,7 @@ func (ps *PolicyStore) ListPolicies(policyType PolicyType) ([]string, error) {
 }
 
 // DeletePolicy is used to delete the named policy
-func (ps *PolicyStore) DeletePolicy(name string, policyType PolicyType) error {
+func (ps *PolicyStore) DeletePolicy(ctx context.Context, name string, policyType PolicyType) error {
 	defer metrics.MeasureSince([]string{"policy", "delete_policy"}, time.Now())
 
 	ps.modifyLock.Lock()
@@ -429,13 +453,13 @@ func (ps *PolicyStore) DeletePolicy(name string, policyType PolicyType) error {
 	switch policyType {
 	case PolicyTypeACL:
 		if strutil.StrListContains(immutablePolicies, name) {
-			return fmt.Errorf("cannot delete %s policy", name)
+			return fmt.Errorf("cannot delete %q policy", name)
 		}
 		if name == "default" {
 			return fmt.Errorf("cannot delete default policy")
 		}
 
-		err := ps.aclView.Delete(name)
+		err := ps.aclView.Delete(ctx, name)
 		if err != nil {
 			return errwrap.Wrapf("failed to delete policy: {{err}}", err)
 		}
@@ -451,17 +475,64 @@ func (ps *PolicyStore) DeletePolicy(name string, policyType PolicyType) error {
 	return nil
 }
 
+type TemplateError struct {
+	Err error
+}
+
+func (t *TemplateError) WrappedErrors() []error {
+	return []error{t.Err}
+}
+
+func (t *TemplateError) Error() string {
+	return t.Err.Error()
+}
+
 // ACL is used to return an ACL which is built using the
 // named policies.
-func (ps *PolicyStore) ACL(names ...string) (*ACL, error) {
+func (ps *PolicyStore) ACL(ctx context.Context, entity *identity.Entity, names ...string) (*ACL, error) {
 	// Fetch the policies
 	var policies []*Policy
 	for _, name := range names {
-		p, err := ps.GetPolicy(name, PolicyTypeToken)
+		p, err := ps.GetPolicy(ctx, name, PolicyTypeToken)
 		if err != nil {
 			return nil, errwrap.Wrapf("failed to get policy: {{err}}", err)
 		}
-		policies = append(policies, p)
+		if p != nil {
+			policies = append(policies, p)
+		}
+	}
+
+	var fetchedGroups bool
+	var groups []*identity.Group
+	for i, policy := range policies {
+		if policy.Type == PolicyTypeACL && policy.Templated {
+			if !fetchedGroups {
+				fetchedGroups = true
+				if entity != nil {
+					directGroups, inheritedGroups, err := ps.core.identityStore.groupsByEntityID(entity.ID)
+					if err != nil {
+						return nil, errwrap.Wrapf("failed to fetch group memberships: {{err}}", err)
+					}
+					groups = append(directGroups, inheritedGroups...)
+				}
+			}
+			subst, templated, err := identity.PopulateString(&identity.PopulateStringInput{
+				String: policy.Raw,
+				Entity: entity,
+				Groups: groups,
+			})
+			if err != nil {
+				return nil, &TemplateError{Err: errwrap.Wrapf(fmt.Sprintf("error performing templating on policy %q: {{err}}", policy.Name), err)}
+			}
+			if !subst {
+				ps.logger.Warn("found templated policy that reported no substitutions", "policy", policy.Name)
+			}
+			p, err := ParseACLPolicy(templated)
+			if err != nil {
+				return nil, errwrap.Wrapf(fmt.Sprintf("error parsing templated policy %q: {{err}}", policy.Name), err)
+			}
+			policies[i] = p
+		}
 	}
 
 	// Construct the ACL
@@ -472,9 +543,9 @@ func (ps *PolicyStore) ACL(names ...string) (*ACL, error) {
 	return acl, nil
 }
 
-func (ps *PolicyStore) loadACLPolicy(policyName, policyText string) error {
+func (ps *PolicyStore) loadACLPolicy(ctx context.Context, policyName, policyText string) error {
 	// Check if the policy already exists
-	policy, err := ps.GetPolicy(policyName, PolicyTypeACL)
+	policy, err := ps.GetPolicy(ctx, policyName, PolicyTypeACL)
 
 	if err != nil {
 		return errwrap.Wrapf(fmt.Sprintf("error fetching %s policy from store: {{err}}", policyName), err)
@@ -492,12 +563,12 @@ func (ps *PolicyStore) loadACLPolicy(policyName, policyText string) error {
 	}
 
 	if policy == nil {
-		return fmt.Errorf("parsing %s policy resulted in nil policy", policyName)
+		return fmt.Errorf("parsing %q policy resulted in nil policy", policyName)
 	}
 
 	policy.Name = policyName
 	policy.Type = PolicyTypeACL
-	return ps.setPolicyInternal(policy)
+	return ps.setPolicyInternal(ctx, policy)
 }
 
 func (ps *PolicyStore) sanitizeName(name string) string {

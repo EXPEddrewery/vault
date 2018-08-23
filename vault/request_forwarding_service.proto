@@ -1,6 +1,8 @@
 syntax = "proto3";
 
-import "github.com/hashicorp/vault/helper/forwarding/types.proto";
+option go_package = "github.com/hashicorp/vault/vault";
+
+import "helper/forwarding/types.proto";
 
 package vault;
 
@@ -17,6 +19,7 @@ message EchoRequest {
 message EchoReply {
 	string message = 1;
 	repeated string cluster_addrs = 2;
+	uint32 replication_state = 3;
 }
 
 service RequestForwarding {
