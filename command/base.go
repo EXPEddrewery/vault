@@ -24,8 +24,8 @@ const (
 	// maxLineLength is the maximum width of any line.
 	maxLineLength int = 78
 
-	// notSetNamespace is a flag value for a not-set namespace
-	notSetNamespace = "(not set)"
+	// notSetValue is a flag value for a not-set value
+	notSetValue = "(not set)"
 )
 
 // reRemoveWhitespace is a regular expression for stripping whitespace from
@@ -38,19 +38,21 @@ type BaseCommand struct {
 	flags     *FlagSets
 	flagsOnce sync.Once
 
-	flagAddress       string
-	flagCACert        string
-	flagCAPath        string
-	flagClientCert    string
-	flagClientKey     string
-	flagNamespace     string
-	flagNS            string
-	flagTLSServerName string
-	flagTLSSkipVerify bool
-	flagWrapTTL       time.Duration
+	flagAddress        string
+	flagCACert         string
+	flagCAPath         string
+	flagClientCert     string
+	flagClientKey      string
+	flagNamespace      string
+	flagNS             string
+	flagPolicyOverride bool
+	flagTLSServerName  string
+	flagTLSSkipVerify  bool
+	flagWrapTTL        time.Duration
 
-	flagFormat string
-	flagField  string
+	flagFormat           string
+	flagField            string
+	flagOutputCurlString bool
 
 	flagMFA []string
 
@@ -75,6 +77,10 @@ func (c *BaseCommand) Client() (*api.Client, error) {
 
 	if c.flagAddress != "" {
 		config.Address = c.flagAddress
+	}
+
+	if c.flagOutputCurlString {
+		config.OutputCurlString = c.flagOutputCurlString
 	}
 
 	// If we need custom TLS configuration, then set it
@@ -126,11 +132,17 @@ func (c *BaseCommand) Client() (*api.Client, error) {
 	}
 
 	client.SetMFACreds(c.flagMFA)
-	switch {
-	case c.flagNS != notSetNamespace:
-		client.SetNamespace(namespace.Canonicalize(c.flagNS))
-	case c.flagNamespace != notSetNamespace:
+
+	// flagNS takes precedence over flagNamespace. After resolution, point both
+	// flags to the same value to be able to use them interchangeably anywhere.
+	if c.flagNS != notSetValue {
+		c.flagNamespace = c.flagNS
+	}
+	if c.flagNamespace != notSetValue {
 		client.SetNamespace(namespace.Canonicalize(c.flagNamespace))
+	}
+	if c.flagPolicyOverride {
+		client.SetPolicyOverride(c.flagPolicyOverride)
 	}
 
 	c.client = client
@@ -253,7 +265,7 @@ func (c *BaseCommand) flagSet(bit FlagSetBit) *FlagSets {
 			f.StringVar(&StringVar{
 				Name:       "namespace",
 				Target:     &c.flagNamespace,
-				Default:    notSetNamespace, // this can never be a real value
+				Default:    notSetValue, // this can never be a real value
 				EnvVar:     "VAULT_NAMESPACE",
 				Completion: complete.PredictAnything,
 				Usage: "The namespace to use for the command. Setting this is not " +
@@ -264,10 +276,10 @@ func (c *BaseCommand) flagSet(bit FlagSetBit) *FlagSets {
 			f.StringVar(&StringVar{
 				Name:       "ns",
 				Target:     &c.flagNS,
-				Default:    notSetNamespace, // this can never be a real value
+				Default:    notSetValue, // this can never be a real value
 				Completion: complete.PredictAnything,
 				Hidden:     true,
-				Usage:      "Alias for -namespace.",
+				Usage:      "Alias for -namespace. This takes precedence over -namespace.",
 			})
 
 			f.StringVar(&StringVar{
@@ -290,6 +302,14 @@ func (c *BaseCommand) flagSet(bit FlagSetBit) *FlagSets {
 					"transmissions to and from the Vault server.",
 			})
 
+			f.BoolVar(&BoolVar{
+				Name:    "policy-override",
+				Target:  &c.flagPolicyOverride,
+				Default: false,
+				Usage: "Override a Sentinel policy that has a soft-mandatory " +
+					"enforcement_level specified",
+			})
+
 			f.DurationVar(&DurationVar{
 				Name:       "wrap-ttl",
 				Target:     &c.flagWrapTTL,
@@ -310,6 +330,15 @@ func (c *BaseCommand) flagSet(bit FlagSetBit) *FlagSets {
 				Completion: complete.PredictAnything,
 				Usage:      "Supply MFA credentials as part of X-Vault-MFA header.",
 			})
+
+			f.BoolVar(&BoolVar{
+				Name:    "output-curl-string",
+				Target:  &c.flagOutputCurlString,
+				Default: false,
+				Usage: "Instead of executing the request, print an equivalent cURL " +
+					"command string and exit.",
+			})
+
 		}
 
 		if bit&(FlagSetOutputField|FlagSetOutputFormat) != 0 {

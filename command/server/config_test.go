@@ -67,6 +67,9 @@ func TestLoadConfigFile(t *testing.T) {
 		EnableRawEndpoint:    true,
 		EnableRawEndpointRaw: true,
 
+		DisableSealWrap:    true,
+		DisableSealWrapRaw: true,
+
 		MaxLeaseTTL:        10 * time.Hour,
 		MaxLeaseTTLRaw:     "10h",
 		DefaultLeaseTTL:    10 * time.Hour,
@@ -134,6 +137,9 @@ func TestLoadConfigFile_topLevel(t *testing.T) {
 
 		EnableRawEndpoint:    true,
 		EnableRawEndpointRaw: true,
+
+		DisableSealWrap:    true,
+		DisableSealWrapRaw: true,
 
 		MaxLeaseTTL:        10 * time.Hour,
 		MaxLeaseTTLRaw:     "10h",
@@ -210,6 +216,8 @@ func TestLoadConfigFile_json(t *testing.T) {
 		PidFile:              "./pidfile",
 		EnableRawEndpoint:    true,
 		EnableRawEndpointRaw: true,
+		DisableSealWrap:      true,
+		DisableSealWrapRaw:   true,
 	}
 	if !reflect.DeepEqual(config, expected) {
 		t.Fatalf("expected \n\n%#v\n\n to be \n\n%#v\n\n", config, expected)
@@ -261,6 +269,8 @@ func TestLoadConfigFile_json2(t *testing.T) {
 
 		EnableRawEndpoint: true,
 
+		DisableSealWrap: true,
+
 		Telemetry: &Telemetry{
 			StatsiteAddr:                       "foo",
 			StatsdAddr:                         "bar",
@@ -296,6 +306,12 @@ func TestLoadConfigDir(t *testing.T) {
 		DisableCache: true,
 		DisableMlock: true,
 
+		DisableClustering:    false,
+		DisableClusteringRaw: false,
+
+		APIAddr:     "https://vault.local",
+		ClusterAddr: "https://127.0.0.1:444",
+
 		Listeners: []*Listener{
 			&Listener{
 				Type: "tcp",
@@ -310,7 +326,9 @@ func TestLoadConfigDir(t *testing.T) {
 			Config: map[string]string{
 				"foo": "bar",
 			},
-			DisableClustering: true,
+			RedirectAddr:      "https://vault.local",
+			ClusterAddr:       "https://127.0.0.1:444",
+			DisableClustering: false,
 		},
 
 		EnableUI: true,

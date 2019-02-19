@@ -1,6 +1,7 @@
 ---
 layout: "guides"
 page_title: "Vault HA with Consul - Guides"
+sidebar_title: "Vault HA with Consul"
 sidebar_current: "guides-operations-vault-ha"
 description: |-
   This guide will walk you through a simple Vault Highly Available (HA) cluster
@@ -23,13 +24,21 @@ and ***active***. Within a Vault cluster, only a single instance will be
 _active_ and handles all requests (reads and writes) and all _standby_ nodes
 redirect requests to the _active_ node.
 
-![Reference Architecture](/assets/images/vault-ha-consul-3.png)
+![Reference Architecture](/img/vault-ha-consul-3.png)
+
+> **NOTE:** As of version **0.11**, those standby nodes can handle most
+read-only requests and behave as read-replica nodes. This **Performance Standby
+Nodes** feature is included in _Vault Enterprise Premium_, and also available
+for _Vault Enterprise Pro_ with additional fee. This is particularly useful for
+processing high volume Encryption as a Service ([Transit secrets
+engine](/docs/secrets/transit/index.html)) requests. Read [Performance Standby
+Nodes](/docs/enterprise/performance-standby/index.html) documentation and a [guide](/guides/operations/performance-nodes.html) for more details.
 
 
 ~> This guide will walk you through a simple Vault Highly Available (HA) cluster
 implementation. While this is not an exhaustive or prescriptive guide that can
-be used as a drop-in production example, it covers the **basics** enough to inform
-your own production setup.
+be used as a drop-in production example, it covers the **basics** enough to
+inform your own production setup.
 
 
 ## Reference Materials
@@ -61,7 +70,7 @@ consisting of the following:
 
 This diagram lays out the simple architecture details for reference:
 
-![Reference Architecture](/assets/images/vault-ha-consul.png)
+![Reference Architecture](/img/vault-ha-consul.png)
 
 You perform the following:
 
@@ -221,7 +230,7 @@ PermissionsStartOnly=true
 ExecStartPre=-/bin/mkdir -p /var/run/consul
 ExecStartPre=/bin/chown -R consul:consul /var/run/consul
 ExecStart=/usr/local/bin/consul agent \
-    -config-file=/usr/local/etc/consul/server_agent.json \
+    -config-file=/usr/local/etc/consul/client_agent.json \
     -pid-file=/var/run/consul/consul.pid
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
@@ -259,7 +268,7 @@ system and verify the status:
        Memory: 13.6M
           CPU: 0m 52.784s
        CGroup: /system.slice/consul.service
-               └─2068 /usr/local/bin/consul agent -config-file=/usr/local/etc/consul/server_agent.json -pid-file=/var/run/consul/consul.pid
+               └─2068 /usr/local/bin/consul agent -config-file=/usr/local/etc/consul/client_agent.json -pid-file=/var/run/consul/consul.pid
 
 After starting all Consul server agents, let’s check the Consul cluster status:
 
@@ -286,7 +295,7 @@ this example.  Now, you are good to move on to the Vault server configuration.
 
 The Vault server nodes require **both** the Consul and Vault binaries on each node. Consul will be configured as a **client** agent and Vault will be configured as a server.
 
-![Reference Architecture](/assets/images/vault-ha-consul-2.png)
+![Reference Architecture](/img/vault-ha-consul-2.png)
 
 
 #### Consul Client Agent Configuration

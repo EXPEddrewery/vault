@@ -3,17 +3,8 @@ package namespace
 import (
 	"context"
 	"errors"
-	"net/http"
 	"strings"
 )
-
-type nsContext struct {
-	context.Context
-	// Note: this is currently not locked because we think all uses will take
-	// place within a single goroutine. If that isn't the case, this should be
-	// protected by an atomic.Value.
-	cachedNS *Namespace
-}
 
 type contextValues struct{}
 
@@ -35,10 +26,6 @@ var (
 	}
 )
 
-var AdjustRequest = func(r *http.Request) (*http.Request, int) {
-	return r.WithContext(ContextWithNamespace(r.Context(), RootNamespace)), 0
-}
-
 func (n *Namespace) HasParent(possibleParent *Namespace) bool {
 	switch {
 	case n.Path == "":
@@ -55,11 +42,7 @@ func (n *Namespace) TrimmedPath(path string) string {
 }
 
 func ContextWithNamespace(ctx context.Context, ns *Namespace) context.Context {
-	nsCtx := context.WithValue(ctx, contextNamespace, ns)
-	return &nsContext{
-		Context:  nsCtx,
-		cachedNS: ns,
-	}
+	return context.WithValue(ctx, contextNamespace, ns)
 }
 
 func RootContext(ctx context.Context) context.Context {
@@ -79,13 +62,6 @@ func FromContext(ctx context.Context) (*Namespace, error) {
 		return nil, errors.New("context was nil")
 	}
 
-	nsCtx, ok := ctx.(*nsContext)
-	if ok {
-		if nsCtx.cachedNS != nil {
-			return nsCtx.cachedNS, nil
-		}
-	}
-
 	nsRaw := ctx.Value(contextNamespace)
 	if nsRaw == nil {
 		return nil, ErrNoNamespace
@@ -96,18 +72,7 @@ func FromContext(ctx context.Context) (*Namespace, error) {
 		return nil, ErrNoNamespace
 	}
 
-	if ok {
-		nsCtx.cachedNS = ns
-	}
 	return ns, nil
-}
-
-func TestContext() context.Context {
-	return ContextWithNamespace(context.Background(), TestNamespace())
-}
-
-func TestNamespace() *Namespace {
-	return RootNamespace
 }
 
 // Canonicalize trims any prefix '/' and adds a trailing '/' to the
@@ -126,4 +91,37 @@ func Canonicalize(nsPath string) string {
 	}
 
 	return nsPath
+}
+
+func SplitIDFromString(input string) (string, string) {
+	prefix := ""
+	slashIdx := strings.LastIndex(input, "/")
+
+	switch {
+	case strings.HasPrefix(input, "b."):
+		prefix = "b."
+		input = input[2:]
+
+	case strings.HasPrefix(input, "s."):
+		prefix = "s."
+		input = input[2:]
+
+	case slashIdx > 0:
+		// Leases will never have a b./s. to start
+		if slashIdx == len(input)-1 {
+			return input, ""
+		}
+		prefix = input[:slashIdx+1]
+		input = input[slashIdx+1:]
+	}
+
+	idx := strings.LastIndex(input, ".")
+	if idx == -1 {
+		return prefix + input, ""
+	}
+	if idx == len(input)-1 {
+		return prefix + input, ""
+	}
+
+	return prefix + input[:idx], input[idx+1:]
 }

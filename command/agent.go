@@ -16,6 +16,8 @@ import (
 	"github.com/hashicorp/errwrap"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/command/agent/auth"
+	"github.com/hashicorp/vault/command/agent/auth/alicloud"
+	"github.com/hashicorp/vault/command/agent/auth/approle"
 	"github.com/hashicorp/vault/command/agent/auth/aws"
 	"github.com/hashicorp/vault/command/agent/auth/azure"
 	"github.com/hashicorp/vault/command/agent/auth/gcp"
@@ -24,7 +26,7 @@ import (
 	"github.com/hashicorp/vault/command/agent/config"
 	"github.com/hashicorp/vault/command/agent/sink"
 	"github.com/hashicorp/vault/command/agent/sink/file"
-	"github.com/hashicorp/vault/helper/gated-writer"
+	gatedwriter "github.com/hashicorp/vault/helper/gated-writer"
 	"github.com/hashicorp/vault/helper/logging"
 	"github.com/hashicorp/vault/version"
 )
@@ -280,10 +282,11 @@ func (c *AgentCommand) Run(args []string) int {
 	authConfig := &auth.AuthConfig{
 		Logger:    c.logger.Named(fmt.Sprintf("auth.%s", config.AutoAuth.Method.Type)),
 		MountPath: config.AutoAuth.Method.MountPath,
-		WrapTTL:   config.AutoAuth.Method.WrapTTL,
 		Config:    config.AutoAuth.Method.Config,
 	}
 	switch config.AutoAuth.Method.Type {
+	case "alicloud":
+		method, err = alicloud.NewAliCloudAuthMethod(authConfig)
 	case "aws":
 		method, err = aws.NewAWSAuthMethod(authConfig)
 	case "azure":
@@ -294,6 +297,8 @@ func (c *AgentCommand) Run(args []string) int {
 		method, err = jwt.NewJWTAuthMethod(authConfig)
 	case "kubernetes":
 		method, err = kubernetes.NewKubernetesAuthMethod(authConfig)
+	case "approle":
+		method, err = approle.NewApproleAuthMethod(authConfig)
 	default:
 		c.UI.Error(fmt.Sprintf("Unknown auth method %q", config.AutoAuth.Method.Type))
 		return 1
@@ -321,8 +326,10 @@ func (c *AgentCommand) Run(args []string) int {
 	})
 
 	ah := auth.NewAuthHandler(&auth.AuthHandlerConfig{
-		Logger: c.logger.Named("auth.handler"),
-		Client: c.client,
+		Logger:                       c.logger.Named("auth.handler"),
+		Client:                       c.client,
+		WrapTTL:                      config.AutoAuth.Method.WrapTTL,
+		EnableReauthOnNewCredentials: config.AutoAuth.EnableReauthOnNewCredentials,
 	})
 
 	// Start things running
