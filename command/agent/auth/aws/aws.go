@@ -134,6 +134,14 @@ func NewAWSAuthMethod(conf *auth.AuthConfig) (auth.AuthMethod, error) {
 		}
 	}
 
+	nonceRaw, ok := conf.Config["nonce"]
+	if ok {
+		a.nonce, ok = nonceRaw.(string)
+		if !ok {
+			return nil, errors.New("could not convert 'nonce' value into string")
+		}
+	}
+
 	if a.authType == typeIAM {
 
 		// Check for an optional custom frequency at which we should poll for creds.
@@ -238,7 +246,7 @@ func (a *awsMethod) Authenticate(ctx context.Context, client *api.Client) (retTo
 		defer a.credLock.Unlock()
 
 		var err error
-		data, err = awsauth.GenerateLoginData(a.lastCreds, a.headerValue)
+		data, err = awsauth.GenerateLoginData(a.lastCreds, a.headerValue, "")
 		if err != nil {
 			retErr = errwrap.Wrapf("error creating login value: {{err}}", err)
 			return

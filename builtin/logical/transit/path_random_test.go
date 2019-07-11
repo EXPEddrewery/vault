@@ -7,15 +7,16 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/hashicorp/vault/logical"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func TestTransit_Random(t *testing.T) {
 	var b *backend
 	sysView := logical.TestSystemView()
 	storage := &logical.InmemStorage{}
+	sysView.CachingDisabledVal = true
 
-	b = Backend(&logical.BackendConfig{
+	b, _ = Backend(context.Background(), &logical.BackendConfig{
 		StorageView: storage,
 		System:      sysView,
 	})
